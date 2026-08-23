@@ -89,6 +89,9 @@ struct write_req {
 	nfcd_result_cb cb;
 	void *user_data;
 	gboolean written;
+	/* Set when something failed after the tag was acquired, so that the
+	 * release step can still report what actually went wrong. */
+	gchar *error_text;
 };
 
 struct simple_req {
@@ -491,8 +494,10 @@ static void set_current_tag(struct nfcd_client *client, const char *path)
 	client->tag_path = g_strdup(path);
 	client->tag_is_type2 = FALSE;
 
-	if (client->tag_json)
+	if (client->tag_json) {
 		j_release(&client->tag_json);
+		client->tag_json = NULL;
+	}
 
 	if (!path) {
 		notify_tag(client);
@@ -1017,6 +1022,7 @@ static void write_req_finish(struct write_req *req, gboolean success, const char
 		g_object_unref(req->tag);
 
 	g_byte_array_free(req->tlv, TRUE);
+	g_free(req->error_text);
 	g_free(req);
 }
 
@@ -1032,7 +1038,7 @@ static void write_release_ready(GObject *source, GAsyncResult *res, gpointer use
 		g_error_free(error);
 	}
 
-	write_req_finish(req, req->written, req->written ? NULL : "Failed to write tag");
+	write_req_finish(req, req->written, req->error_text);
 }
 
 static void write_release(struct write_req *req)
@@ -1051,10 +1057,14 @@ static void write_data_ready(GObject *source, GAsyncResult *res, gpointer user_d
 	if (nfcd_interface_tag_type2_call_write_data_finish(type2, &written, res, &error)) {
 		req->written = (written == req->tlv->len);
 
-		if (!req->written)
+		if (!req->written) {
 			g_warning("Short write to tag: %u of %u bytes", written, req->tlv->len);
+			req->error_text = g_strdup_printf("Only %u of %u bytes reached the tag",
+			                                  written, req->tlv->len);
+		}
 	} else {
 		g_warning("Failed to write tag: %s", error->message);
+		req->error_text = g_strdup_printf("Failed to write the tag: %s", error->message);
 		g_error_free(error);
 		req->written = FALSE;
 	}
@@ -1071,12 +1081,12 @@ static void write_type2_proxy_ready(GObject *source, GAsyncResult *res, gpointer
 	req->type2 = nfcd_interface_tag_type2_proxy_new_for_bus_finish(res, &error);
 
 	if (!req->type2) {
-		gchar *text = g_strdup_printf("Failed to reach the tag: %s", error->message);
-
+		req->error_text = g_strdup_printf("Failed to reach the tag: %s", error->message);
 		g_error_free(error);
 		req->written = FALSE;
-		write_req_finish(req, FALSE, text);
-		g_free(text);
+
+		/* The tag was already acquired, so give the lock back */
+		write_release(req);
 		return;
 	}
 

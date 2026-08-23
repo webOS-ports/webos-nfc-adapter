@@ -207,9 +207,10 @@ static bool _service_set_enabled_cb(LSHandle *handle, LSMessage *message, void *
 		return true;
 	}
 
+	/* jboolean_get follows the pbnjson convention of returning 0 on success */
 	if (!jobject_get_exists(parsed_obj, J_CSTR_TO_BUF("enabled"), &enabled_obj) ||
 	    !jis_boolean(enabled_obj) ||
-	    !jboolean_get(enabled_obj, &enabled)) {
+	    jboolean_get(enabled_obj, &enabled) != 0) {
 		luna_service_message_reply_error_invalid_params(handle, message);
 		j_release(&parsed_obj);
 		return true;

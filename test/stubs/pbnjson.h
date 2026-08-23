@@ -25,8 +25,8 @@ extern bool jis_null(jvalue_ref val);
 extern bool jis_string(jvalue_ref val);
 extern bool jis_boolean(jvalue_ref val);
 extern bool jis_number(jvalue_ref val);
-extern bool jboolean_get(jvalue_ref val, bool *out);
-extern bool jnumber_get_i32(jvalue_ref val, int *out);
+extern int jboolean_get(jvalue_ref val, bool *out);   /* JResult: 0 == OK */
+extern int jnumber_get_i32(jvalue_ref val, int *out);   /* JResult: 0 == OK */
 extern raw_buffer jstring_get_fast(jvalue_ref val);
 extern const char *jvalue_tostring(jvalue_ref val, jschema_ref schema);
 extern jschema_ref jschema_parse(raw_buffer input, JDOMOptimization opt, void *err);
