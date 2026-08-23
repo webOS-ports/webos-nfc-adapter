@@ -1,0 +1,13 @@
+[Unit]
+Description=webOS NFC adapter
+Requires=ls-hubd.service
+After=ls-hubd.service nfcd.service
+Wants=nfcd.service
+
+[Service]
+Type=simple
+Restart=on-failure
+ExecStart=/usr/sbin/webos-nfc-adapter
+
+[Install]
+WantedBy=multi-user.target

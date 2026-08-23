@@ -1,0 +1,5 @@
+{
+ "allowedNames": ["com.webos.service.nfc"],
+ "nfc.operation": ["dev"],
+ "nfc.query": ["dev"]
+}

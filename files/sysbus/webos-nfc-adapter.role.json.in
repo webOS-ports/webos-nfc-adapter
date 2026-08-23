@@ -1,0 +1,13 @@
+{
+    "exeName":"@WEBOS_INSTALL_SBINDIR@/webos-nfc-adapter",
+    "trustLevel": "oem",
+    "type": "privileged",
+    "allowedNames": ["com.webos.service.nfc"],
+    "permissions": [
+        {
+            "service":"com.webos.service.nfc",
+            "inbound":["*"],
+            "outbound":["*"]
+        }
+    ]
+}

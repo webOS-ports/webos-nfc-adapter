@@ -1,0 +1,12 @@
+{
+    "nfc.operation": [
+        "com.webos.service.nfc/getStatus",
+        "com.webos.service.nfc/setEnabled",
+        "com.webos.service.nfc/getTagInfo",
+        "com.webos.service.nfc/writeTag"
+    ],
+    "nfc.query": [
+        "com.webos.service.nfc/getStatus",
+        "com.webos.service.nfc/getTagInfo"
+    ]
+}

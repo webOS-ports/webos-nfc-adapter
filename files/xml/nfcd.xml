@@ -1,0 +1,555 @@
+<!DOCTYPE node PUBLIC "-//freedesktop//DTD D-BUS Object Introspection 1.0//EN"
+  "http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd">
+<!--
+  Subset of the nfcd D-Bus API that webos-nfc-adapter consumes.
+
+  Taken from nfcd 1.2.7 (https://github.com/sailfishos/nfcd):
+    plugins/dbus_service/org.sailfishos.nfc.{Daemon,Adapter,Tag,TagType2,NDEF}.xml
+    plugins/settings/org.sailfishos.nfc.Settings.xml
+
+  Two bus names are involved, both on the system bus:
+    org.sailfishos.nfc.daemon    /        Daemon
+                                 /nfc0    Adapter
+                                 /nfc0/tag0        Tag, TagType2
+                                 /nfc0/tag0/rec0   NDEF
+    org.sailfishos.nfc.settings  /        Settings
+-->
+<node>
+<interface name="org.sailfishos.nfc.Daemon">
+    <method name="GetAll">
+      <arg name="version" type="i" direction="out"/>
+      <arg name="adapters" type="ao" direction="out"/>
+    </method>
+    <method name="GetInterfaceVersion">
+      <arg name="version" type="i" direction="out"/>
+    </method>
+    <method name="GetAdapters">
+      <arg name="adapters" type="ao" direction="out"/>
+    </method>
+    <signal name="AdaptersChanged">
+      <arg name="adapters" type="ao"/>
+    </signal>
+    <!-- Interface version 2 (since 1.0.26) -->
+    <method name="GetAll2">
+      <arg name="version" type="i" direction="out"/>
+      <arg name="adapters" type="ao" direction="out"/>
+      <arg name="daemon_version" type="i" direction="out"/>
+    </method>
+    <method name="GetDaemonVersion">
+      <arg name="daemon_version" type="i" direction="out"/>
+    </method>
+    <!-- Interface version 3 (since 1.1.0) -->
+    <method name="GetAll3">
+      <arg name="version" type="i" direction="out"/>
+      <arg name="adapters" type="ao" direction="out"/>
+      <arg name="daemon_version" type="i" direction="out"/>
+      <arg name="mode" type="u" direction="out"/>
+    </method>
+    <!--
+      Mode is a bitmask.
+
+      Polling bits:
+        0x01 - P2P Initiator
+        0x02 - Reader/Writer
+
+      Listening bits:
+        0x04 - P2P Target
+        0x08 - Card Emulation
+    -->
+    <method name="GetMode">
+      <arg name="mode" type="u" direction="out"/>
+    </method>
+    <signal name="ModeChanged">
+      <arg name="mode" type="u"/>
+    </signal>
+    <method name="RequestMode">
+      <arg name="enable" type="u" direction="in"/>
+      <arg name="disable" type="u" direction="in"/>
+      <arg name="id" type="u" direction="out"/>
+    </method>
+    <method name="ReleaseMode">
+      <arg name="id" type="u" direction="in"/>
+    </method>
+    <method name="RegisterLocalService">
+      <!-- Registers instance of org.sailfishos.nfc.LocalService -->
+      <arg name="path" type="o" direction="in"/>
+      <arg name="name" type="s" direction="in"/>
+      <arg name="sap" type="u" direction="out"/>
+    </method>
+    <method name="UnregisterLocalService">
+      <arg name="path" type="o" direction="in"/>
+    </method>
+    <!-- Interface version 4 (since 1.2.0) -->
+    <method name="GetAll4">
+      <arg name="version" type="i" direction="out"/>
+      <arg name="adapters" type="ao" direction="out"/>
+      <arg name="daemon_version" type="i" direction="out"/>
+      <arg name="mode" type="u" direction="out"/>
+      <arg name="techs" type="u" direction="out"/>
+    </method>
+    <!--
+      Techs is a bitmask:
+
+        0x01 - NFC-A
+        0x02 - NFC-B
+        0x04 - NFC-F
+    -->
+    <method name="GetTechs">
+      <arg name="techs" type="u" direction="out"/>
+    </method>
+    <signal name="TechsChanged">
+      <arg name="techs" type="u"/>
+    </signal>
+    <method name="RequestTechs">
+      <arg name="allow" type="u" direction="in"/>
+      <arg name="disallow" type="u" direction="in"/>
+      <arg name="id" type="u" direction="out"/>
+    </method>
+    <method name="ReleaseTechs">
+      <arg name="id" type="u" direction="in"/>
+    </method>
+    <method name="RegisterLocalHostService">
+      <!-- Registers instance of org.sailfishos.nfc.LocalHostService -->
+      <arg name="path" type="o" direction="in"/>
+      <arg name="name" type="s" direction="in"/>
+    </method>
+    <method name="UnregisterLocalHostService">
+      <arg name="path" type="o" direction="in"/>
+    </method>
+    <method name="RegisterLocalHostApp">
+      <!-- Registers instance of org.sailfishos.nfc.LocalHostApp -->
+      <arg name="path" type="o" direction="in"/>
+      <arg name="name" type="s" direction="in"/>
+      <arg name="aid" type="ay" direction="in">
+        <annotation name="org.gtk.GDBus.C.ForceGVariant" value="true"/>
+      </arg>
+      <!--
+        Flags is a bitmask.
+
+        0x01 - Allow implicit selection
+      -->
+      <arg name="flags" type="u" direction="in"/>
+    </method>
+    <method name="UnregisterLocalHostApp">
+      <arg name="path" type="o" direction="in"/>
+    </method>
+    <!-- Interface version 5 (since 1.2.3) -->
+    <method name="RegisterLocalHostService2">
+      <!-- Registers instance of org.sailfishos.nfc.LocalHostService -->
+      <arg name="path" type="o" direction="in"/>
+      <arg name="name" type="s" direction="in"/>
+      <arg name="version" type="i" direction="in"/>
+    </method>
+    <!-- Interface version 6 (since 1.2.7) -->
+    <method name="GetAll6">
+      <arg name="version" type="i" direction="out"/>
+      <arg name="adapters" type="ao" direction="out"/>
+      <arg name="daemon_version" type="i" direction="out"/>
+      <arg name="mode" type="u" direction="out"/>
+      <arg name="techs" type="u" direction="out"/>
+      <arg name="blocked" type="b" direction="out"/>
+    </method>
+    <method name="GetBlocked">
+      <arg name="blocked" type="b" direction="out"/>
+    </method>
+    <signal name="BlockedChanged">
+      <arg name="blocked" type="b"/>
+    </signal>
+    <method name="RequestBlock">
+      <arg name="id" type="u" direction="out"/>
+    </method>
+    <method name="ReleaseBlock">
+      <arg name="id" type="u" direction="in"/>
+    </method>
+  </interface>
+<interface name="org.sailfishos.nfc.Adapter">
+    <method name="GetAll">
+      <arg name="version" type="i" direction="out"/>
+      <arg name="enabled" type="b" direction="out"/>
+      <arg name="powered" type="b" direction="out"/>
+      <arg name="supported_modes" type="u" direction="out"/>
+      <arg name="mode" type="u" direction="out"/>
+      <arg name="target_present" type="b" direction="out"/>
+      <arg name="tags" type="ao" direction="out"/>
+    </method>
+    <method name="GetInterfaceVersion">
+      <arg name="version" type="i" direction="out"/>
+    </method>
+    <method name="GetEnabled">
+      <arg name="enabled" type="b" direction="out"/>
+    </method>
+    <method name="GetPowered">
+      <arg name="powered" type="b" direction="out"/>
+    </method>
+    <method name="GetSupportedModes">
+      <arg name="mode" type="u" direction="out"/>
+    </method>
+    <method name="GetMode">
+      <arg name="mode" type="u" direction="out"/>
+    </method>
+    <method name="GetTargetPresent">
+      <arg name="target_present" type="b" direction="out"/>
+    </method>
+    <method name="GetTags">
+      <arg name="tags" type="ao" direction="out"/>
+    </method>
+    <!-- Signals -->
+    <signal name="EnabledChanged">
+      <arg name="enabled" type="b"/>
+    </signal>
+    <signal name="PoweredChanged">
+      <arg name="powered" type="b"/>
+    </signal>
+    <signal name="ModeChanged">
+      <arg name="mode" type="u"/>
+    </signal>
+    <signal name="TargetPresentChanged">
+      <arg name="target_present" type="b"/>
+    </signal>
+    <signal name="TagsChanged">
+      <arg name="tags" type="ao"/>
+    </signal>
+    <!-- Interface version 2 (since 1.1.0) -->
+    <method name="GetAll2">
+      <arg name="version" type="i" direction="out"/>
+      <arg name="enabled" type="b" direction="out"/>
+      <arg name="powered" type="b" direction="out"/>
+      <arg name="supported_modes" type="u" direction="out"/>
+      <arg name="mode" type="u" direction="out"/>
+      <arg name="present" type="b" direction="out"/>
+      <arg name="tags" type="ao" direction="out"/>
+      <arg name="peers" type="ao" direction="out"/>
+    </method>
+    <method name="GetPeers">
+      <arg name="peers" type="ao" direction="out"/>
+    </method>
+    <signal name="PeersChanged">
+      <arg name="peers" type="ao"/>
+    </signal>
+    <!-- Interface version 3 (since 1.2.0) -->
+    <method name="GetAll3">
+      <arg name="version" type="i" direction="out"/>
+      <arg name="enabled" type="b" direction="out"/>
+      <arg name="powered" type="b" direction="out"/>
+      <arg name="supported_modes" type="u" direction="out"/>
+      <arg name="mode" type="u" direction="out"/>
+      <arg name="present" type="b" direction="out"/>
+      <arg name="tags" type="ao" direction="out"/>
+      <arg name="peers" type="ao" direction="out"/>
+      <arg name="hosts" type="ao" direction="out"/>
+      <arg name="supported_techs" type="u" direction="out"/>
+    </method>
+    <method name="GetHosts">
+      <arg name="hosts" type="ao" direction="out"/>
+    </method>
+    <signal name="HostsChanged">
+      <arg name="hosts" type="ao"/>
+    </signal>
+    <!--
+      Techs is a bitmask:
+
+        0x01 - NFC-A
+        0x02 - NFC-B
+        0x04 - NFC-F
+    -->
+    <method name="GetSupportedTechs">
+      <arg name="techs" type="u" direction="out"/>
+    </method>
+    <!-- Interface version 4 (since 1.2.2) -->
+    <method name="GetAll4">
+      <arg name="version" type="i" direction="out"/>
+      <arg name="enabled" type="b" direction="out"/>
+      <arg name="powered" type="b" direction="out"/>
+      <arg name="supported_modes" type="u" direction="out"/>
+      <arg name="mode" type="u" direction="out"/>
+      <arg name="present" type="b" direction="out"/>
+      <arg name="tags" type="ao" direction="out"/>
+      <arg name="peers" type="ao" direction="out"/>
+      <arg name="hosts" type="ao" direction="out"/>
+      <arg name="supported_techs" type="u" direction="out"/>
+      <!--
+        Parameters:
+
+        "T4_NDEF"   - "b", Request NDEF from Type4 tags
+        "LA_NFCID1" - "ay", NFCID1 in NFC-A Listen mode
+        "LI_A_HB"   - "ay", ATS Historical Bytes in Listen A mode (nfcd >= 1.2.4)
+
+      -->
+      <arg name="params" type="a{sv}" direction="out"/>
+    </method>
+    <method name="GetParams">
+      <arg name="params" type="a{sv}" direction="out"/>
+    </method>
+    <signal name="ParamChanged">
+      <arg name="name" type="s"/>
+      <arg name="value" type="v"/>
+    </signal>
+    <method name="RequestParams">
+      <arg name="set" type="a{sv}" direction="in"/>
+      <arg name="reset" type="b" direction="in"/>
+      <arg name="id" type="u" direction="out"/>
+    </method>
+    <method name="ReleaseParams">
+      <arg name="id" type="u" direction="in"/>
+    </method>
+  </interface>
+<interface name="org.sailfishos.nfc.Settings">
+    <method name="GetAll">
+      <arg name="version" type="i" direction="out"/>
+      <arg name="enabled" type="b" direction="out"/>
+    </method>
+    <method name="GetInterfaceVersion">
+      <arg name="version" type="i" direction="out"/>
+    </method>
+    <method name="GetEnabled">
+      <arg name="enabled" type="b" direction="out"/>
+    </method>
+    <method name="SetEnabled">
+      <arg name="enabled" type="b" direction="in"/>
+    </method>
+    <!-- Signals -->  
+    <signal name="EnabledChanged">
+      <arg name="enabled" type="b"/>
+    </signal>
+    <!-- Interface version 2 (since nfcd 1.1.10) -->
+    <method name="GetAll2">
+      <arg name="version" type="i" direction="out"/>
+      <arg name="enabled" type="b" direction="out"/>
+      <arg name="plugin_settings" type="a(sa{sv})" direction="out"/>
+    </method>
+    <method name="GetAllPluginSettings">
+      <arg name="plugin_settings" type="a(sa{sv})" direction="out"/>
+    </method>
+    <method name="GetPluginSettings">
+      <arg name="plugin" type="s" direction="in"/>
+      <arg name="settings" type="a{sv}" direction="out"/>
+    </method>
+    <method name="GetPluginValue">
+      <arg name="plugin" type="s" direction="in"/>
+      <arg name="key" type="s" direction="in"/>
+      <arg name="value" type="v" direction="out"/>
+    </method>
+    <method name="SetPluginValue">
+      <arg name="plugin" type="s" direction="in"/>
+      <arg name="key" type="s" direction="in"/>
+      <arg name="value" type="v" direction="in"/>
+    </method>
+    <!-- Signals -->
+    <signal name="PluginValueChanged">
+      <arg name="plugin" type="s"/>
+      <arg name="key" type="s"/>
+      <arg name="value" type="v"/>
+    </signal>
+  </interface>
+<interface name="org.sailfishos.nfc.Tag">
+    <!--
+      Technologies:
+
+        0 - Unknown
+        1 - NFC-A
+        2 - NFC-B
+        4 - NFC-F
+
+      Protocols:
+
+        0 - Unknown
+        1 - Type 1 Tag
+        2 - Type 2 Tag
+        4 - Type 3 Tag
+        8 - Type 4A Tag (ISO-DEP, ISO 14443)
+        16 - Type 4B Tag,(ISO-DEP, ISO 14443)
+        32 - NFC-DEP Protocol (ISO 18092)
+
+      The above codes are bitmasks elsewhere, but here used as enum values.
+
+      Poll Parameters:
+
+        NFC-A:
+          "SEL_RES"  - "ay", SEL_RES Response
+          "NFCID1"   - "ay", Device identifier
+
+        NFC-B:
+          "NFCID0"   - "ay", NFCID0 (device identifier) part of SENSB_RES
+          "APPDATA"  - "ay", Application Data part of SENSB_RES
+          "PROTINFO" - "ay", Protocol Info part of SENSB_RES
+
+    -->
+    <method name="GetAll">
+      <arg name="version" type="i" direction="out"/>
+      <arg name="present" type="b" direction="out"/>
+      <arg name="technology" type="u" direction="out"/>
+      <arg name="protocol" type="u" direction="out"/>
+      <arg name="type" type="u" direction="out"/>
+      <arg name="interfaces" type="as" direction="out"/>
+      <arg name="ndef_records" type="ao" direction="out"/>
+    </method>
+    <method name="GetInterfaceVersion">
+      <arg name="version" type="i" direction="out"/>
+    </method>
+    <method name="GetPresent">
+      <arg name="present" type="b" direction="out"/>
+    </method>
+    <method name="GetTechnology">
+      <arg name="technology" type="u" direction="out"/>
+    </method>
+    <method name="GetProtocol">
+      <arg name="protocol" type="u" direction="out"/>
+    </method>
+    <method name="GetType">
+      <arg name="type" type="u" direction="out"/>
+    </method>
+    <method name="GetInterfaces">
+      <arg name="interfaces" type="as" direction="out"/>
+    </method>
+    <method name="GetNdefRecords">
+      <arg name="ndef_records" type="ao" direction="out"/>
+    </method>
+    <method name="Deactivate"/>
+    <!-- Interface version 2 -->
+    <signal name="Removed"/>
+    <method name="Acquire">
+      <arg name="wait" type="b" direction="in"/>
+    </method>
+    <method name="Release"/>
+    <!-- Interface version 3 -->
+    <method name="GetAll3">
+      <arg name="version" type="i" direction="out"/>
+      <arg name="present" type="b" direction="out"/>
+      <arg name="technology" type="u" direction="out"/>
+      <arg name="protocol" type="u" direction="out"/>
+      <arg name="type" type="u" direction="out"/>
+      <arg name="interfaces" type="as" direction="out"/>
+      <arg name="ndef_records" type="ao" direction="out"/>
+      <arg name="poll_parameters" type="a{sv}" direction="out"/>
+    </method>
+    <method name="GetPollParameters">
+      <arg name="poll_parameters" type="a{sv}" direction="out"/>
+    </method>
+    <!-- Interface version 4 -->
+    <method name="Transceive">
+      <arg name="data" type="ay" direction="in">
+        <annotation name="org.gtk.GDBus.C.ForceGVariant" value="true"/>
+      </arg>
+      <arg name="response" type="ay" direction="out">
+        <annotation name="org.gtk.GDBus.C.ForceGVariant" value="true"/>
+      </arg>
+    </method>
+    <!-- Interface version 5 -->
+    <method name="Acquire2"> <!-- Allows presense check -->
+      <arg name="wait" type="b" direction="in"/>
+    </method>
+    <method name="Release2"/> <!-- Matches Acquire2 -->
+  </interface>
+<interface name="org.sailfishos.nfc.TagType2">
+    <method name="GetAll">
+      <arg name="version" type="i" direction="out"/>
+      <arg name="block_size" type="u" direction="out"/>
+      <arg name="data_size" type="u" direction="out"/>
+      <arg name="serial" type="ay" direction="out">
+        <annotation name="org.gtk.GDBus.C.ForceGVariant" value="true"/>
+      </arg>
+    </method>
+    <method name="GetInterfaceVersion">
+      <arg name="version" type="i" direction="out"/>
+    </method>
+    <method name="GetBlockSize">
+      <arg name="block_size" type="u" direction="out"/>
+    </method>
+    <method name="GetDataSize">
+      <arg name="data_size" type="u" direction="out"/>
+    </method>
+    <method name="GetSerial">
+      <arg name="serial" type="ay" direction="out">
+        <annotation name="org.gtk.GDBus.C.ForceGVariant" value="true"/>
+      </arg>
+    </method>
+    <method name="Read">
+      <arg name="sector" type="u" direction="in"/>
+      <arg name="block" type="u" direction="in"/>
+      <arg name="data" type="ay" direction="out">
+        <annotation name="org.gtk.GDBus.C.ForceGVariant" value="true"/>
+      </arg>
+    </method>
+    <method name="Write">
+      <arg name="sector" type="u" direction="in"/>
+      <arg name="block" type="u" direction="in"/>
+      <arg name="data" type="ay" direction="in">
+        <annotation name="org.gtk.GDBus.C.ForceGVariant" value="true"/>
+      </arg>
+      <arg name="written" type="u" direction="out"/>
+    </method>
+    <method name="ReadData">
+      <arg name="offset" type="u" direction="in"/>
+      <arg name="maxbytes" type="u" direction="in"/>
+      <arg name="data" type="ay" direction="out">
+        <annotation name="org.gtk.GDBus.C.ForceGVariant" value="true"/>
+      </arg>
+    </method>
+    <method name="ReadAllData">
+      <arg name="data" type="ay" direction="out">
+        <annotation name="org.gtk.GDBus.C.ForceGVariant" value="true"/>
+      </arg>
+    </method>
+    <method name="WriteData">
+      <arg name="offset" type="u" direction="in"/>
+      <arg name="data" type="ay" direction="in">
+        <annotation name="org.gtk.GDBus.C.ForceGVariant" value="true"/>
+      </arg>
+      <arg name="written" type="u" direction="out"/>
+    </method>
+  </interface>
+<interface name="org.sailfishos.nfc.NDEF">
+    <method name="GetAll">
+      <arg name="version" type="i" direction="out"/>
+      <arg name="flags" type="u" direction="out"/>
+      <arg name="tnf" type="u" direction="out"/>
+      <arg name="interfaces" type="as" direction="out"/>
+      <arg name="type" type="ay" direction="out">
+        <annotation name="org.gtk.GDBus.C.ForceGVariant" value="true"/>
+      </arg>
+      <arg name="id" type="ay" direction="out">
+        <annotation name="org.gtk.GDBus.C.ForceGVariant" value="true"/>
+      </arg>
+      <arg name="payload" type="ay" direction="out">
+        <annotation name="org.gtk.GDBus.C.ForceGVariant" value="true"/>
+      </arg>
+    </method>
+    <method name="GetInterfaceVersion">
+      <arg name="version" type="i" direction="out"/>
+    </method>
+    <method name="GetFlags">
+      <arg name="present" type="u" direction="out"/>
+    </method>
+    <method name="GetTypeNameFormat">
+      <arg name="tnf" type="u" direction="out"/>
+    </method>
+    <method name="GetInterfaces">
+      <arg name="interfaces" type="as" direction="out"/>
+    </method>
+    <method name="GetType">
+      <arg name="type" type="ay" direction="out">
+        <annotation name="org.gtk.GDBus.C.ForceGVariant" value="true"/>
+      </arg>
+    </method>
+    <method name="GetId">
+      <arg name="id" type="ay" direction="out">
+        <annotation name="org.gtk.GDBus.C.ForceGVariant" value="true"/>
+      </arg>
+    </method>
+    <method name="GetPayload">
+      <arg name="payload" type="ay" direction="out">
+        <annotation name="org.gtk.GDBus.C.ForceGVariant" value="true"/>
+      </arg>
+    </method>
+    <!--
+      GetAll doesn't return raw data because it would contain type,
+      id and payloaded which in most cases would be a waste. If needed,
+      the raw data can be fetched with a separate method:
+    -->
+    <method name="GetRawData">
+      <arg name="data" type="ay" direction="out">
+        <annotation name="org.gtk.GDBus.C.ForceGVariant" value="true"/>
+      </arg>
+    </method>
+  </interface>
+</node>
