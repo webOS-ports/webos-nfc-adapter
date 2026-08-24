@@ -29,6 +29,9 @@
 
 #define TAG_IFACE_TYPE2			"org.sailfishos.nfc.TagType2"
 
+/* org.sailfishos.nfc.Daemon polling bit: see Daemon.xml */
+#define NFCD_MODE_READER_WRITER	0x02
+
 struct tag_read;
 
 struct nfcd_client {
@@ -51,6 +54,15 @@ struct nfcd_client {
 	guint supported_modes;
 	guint techs;
 	gint daemon_version;
+
+	/* Reader/writer mode we hold on the daemon for our whole lifetime, so
+	 * any client that shows up (ndef-read included) finds the radio already
+	 * polling. nfcd releases it on its own if our bus connection drops, the
+	 * same as every other resource it hands out (Tag.Acquire and friends),
+	 * so there is nothing to release explicitly on our own shutdown. 0 means
+	 * "not currently held".
+	 */
+	guint mode_request_id;
 
 	/* The enabled flag is owned by the settings plugin, but the adapter
 	 * reports it too. Prefer the settings value when we have it. */
@@ -707,6 +719,26 @@ static void daemon_get_all_ready(GObject *source, GAsyncResult *res, gpointer us
 	g_strfreev(adapters);
 }
 
+static void request_reader_writer_mode_ready(GObject *source, GAsyncResult *res,
+                                             gpointer user_data)
+{
+	struct nfcd_client *client = user_data;
+	NfcdInterfaceDaemon *daemon = NFCD_INTERFACE_DAEMON(source);
+	GError *error = NULL;
+	guint id = 0;
+
+	if (nfcd_interface_daemon_call_request_mode_finish(daemon, &id, res, &error)) {
+		client->mode_request_id = id;
+	} else {
+		/* Reading and writing tags just won't work until nfcd is restarted
+		 * or this client reconnects, so this is worth more than a debug
+		 * line, but it's not fatal: getStatus/getTagInfo etc. still work. */
+		if (!g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
+			g_warning("Failed to request reader/writer mode: %s", error->message);
+		g_error_free(error);
+	}
+}
+
 static void daemon_proxy_ready(GObject *source, GAsyncResult *res, gpointer user_data)
 {
 	struct nfcd_client *client = user_data;
@@ -726,12 +758,26 @@ static void daemon_proxy_ready(GObject *source, GAsyncResult *res, gpointer user
 		g_object_unref(client->daemon);
 
 	client->daemon = daemon;
+	client->mode_request_id = 0;
 
 	g_signal_connect(daemon, "adapters-changed",
 	                 G_CALLBACK(daemon_adapters_changed), client);
 
 	nfcd_interface_daemon_call_get_all4(daemon, client->cancellable,
 	                                    daemon_get_all_ready, client);
+
+	/*
+	 * nfcd starts every adapter with mode 0 (nothing polling) and expects a
+	 * client to ask for a mode: on Sailfish that's their screen-state aware
+	 * NFC middleware, which LuneOS has no equivalent of. Tools like ndef-read
+	 * only listen for tags-changed, they never request a mode themselves, so
+	 * without this nothing would ever be detected. Hold reader/writer for as
+	 * long as we're connected to the daemon; nfcd's own enabled setting
+	 * remains the real on/off switch.
+	 */
+	nfcd_interface_daemon_call_request_mode(daemon, NFCD_MODE_READER_WRITER, 0,
+	                                        client->cancellable,
+	                                        request_reader_writer_mode_ready, client);
 }
 
 static void daemon_appeared(GDBusConnection *connection, const gchar *name,
@@ -760,6 +806,7 @@ static void daemon_vanished(GDBusConnection *connection, const gchar *name,
 	}
 
 	client->daemon_version = 0;
+	client->mode_request_id = 0;
 
 	attach_adapter(client, NULL);
 }
