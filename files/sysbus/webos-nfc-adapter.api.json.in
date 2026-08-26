@@ -3,7 +3,9 @@
         "com.webos.service.nfc/getStatus",
         "com.webos.service.nfc/setEnabled",
         "com.webos.service.nfc/getTagInfo",
-        "com.webos.service.nfc/writeTag"
+        "com.webos.service.nfc/writeTag",
+        "com.webos.service.nfc/lockTag",
+        "com.webos.service.nfc/cloneTag"
     ],
     "nfc.query": [
         "com.webos.service.nfc/getStatus",

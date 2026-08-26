@@ -1,5 +1,8 @@
 {
     "com.webos.service.nfc": [
         "nfc.operation"
+    ],
+    "com.webos.surfacemanager-cardshell": [
+        "nfc.operation"
     ]
 }
