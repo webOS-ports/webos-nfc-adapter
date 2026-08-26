@@ -24,6 +24,7 @@
 #include "ndef.h"
 #include "bac.h"
 #include "pace.h"
+#include "photo_convert.h"
 
 #define NFCD_DAEMON_SERVICE		"org.sailfishos.nfc.daemon"
 #define NFCD_SETTINGS_SERVICE	"org.sailfishos.nfc.settings"
@@ -1192,6 +1193,18 @@ static void passport_build_result_and_finish(struct passport_read *read)
 	if (dg2) {
 		photo = bac_extract_dg2_photo(dg2->data, dg2->len, &photo_format);
 		g_byte_array_free(dg2, TRUE);
+	}
+	if (photo && g_strcmp0(photo_format, "jpeg2000") == 0) {
+		/* QML has no JPEG2000 decoder on this platform - convert to
+		 * BMP so it's actually displayable. Keep the original JP2
+		 * bytes if conversion fails; still useful for debugging. */
+		GByteArray *bmp = photo_jp2_to_bmp(photo->data, photo->len);
+
+		if (bmp) {
+			g_byte_array_free(photo, TRUE);
+			photo = bmp;
+			photo_format = "bmp";
+		}
 	}
 
 	result.mrz_text = mrz;
