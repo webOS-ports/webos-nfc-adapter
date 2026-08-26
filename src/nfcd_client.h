@@ -115,6 +115,14 @@ void nfcd_client_read_passport(struct nfcd_client *client, const char *document_
                                const char *date_of_birth, const char *date_of_expiry,
                                nfcd_passport_cb cb, void *user_data);
 
+/**
+ * Same read, but via PACE (using the document's printed CAN) instead of
+ * BAC - the path documents that reject nfcd_client_read_passport() with
+ * "instead of BAC" need. Same failure-mode guarantees as above.
+ */
+void nfcd_client_read_passport_pace(struct nfcd_client *client, const char *can,
+                                    nfcd_passport_cb cb, void *user_data);
+
 #endif
 
 // vim:ts=4:sw=4:noexpandtab

@@ -237,15 +237,13 @@ static gboolean mrz_check_digit(const char *field, gsize len, char *digit_out)
 #define MRZ_DOC_NUMBER_LEN	9
 #define MRZ_DATE_LEN		6
 
-gboolean bac_derive_static_keys(const char *document_number, const char *date_of_birth,
-                                const char *date_of_expiry, BacStaticKeys *keys_out)
+gboolean bac_mrz_sha1(const char *document_number, const char *date_of_birth,
+                      const char *date_of_expiry, guint8 out[SHA_DIGEST_LENGTH])
 {
 	char doc[MRZ_DOC_NUMBER_LEN];
 	char mrz_info[3 * MRZ_DOC_NUMBER_LEN]; /* generous; actual use is 24 bytes */
 	gsize pos = 0;
 	char digit;
-	guint8 kseed[BAC_KEY_LEN]; /* most significant 16 bytes of the SHA-1 digest */
-	guint8 digest[SHA_DIGEST_LENGTH];
 
 	if (!document_number || !date_of_birth || !date_of_expiry)
 		return FALSE;
@@ -276,13 +274,24 @@ gboolean bac_derive_static_keys(const char *document_number, const char *date_of
 		return FALSE;
 	mrz_info[pos++] = digit;
 
-	sha1((const guint8 *) mrz_info, pos, digest);
+	sha1((const guint8 *) mrz_info, pos, out);
+	memset(mrz_info, 0, sizeof(mrz_info));
+	return TRUE;
+}
+
+gboolean bac_derive_static_keys(const char *document_number, const char *date_of_birth,
+                                const char *date_of_expiry, BacStaticKeys *keys_out)
+{
+	guint8 digest[SHA_DIGEST_LENGTH];
+	guint8 kseed[BAC_KEY_LEN]; /* most significant 16 bytes of the SHA-1 digest */
+
+	if (!bac_mrz_sha1(document_number, date_of_birth, date_of_expiry, digest))
+		return FALSE;
 	memcpy(kseed, digest, BAC_KEY_LEN);
 
 	kdf(kseed, 1, keys_out->kenc);
 	kdf(kseed, 2, keys_out->kmac);
 
-	memset(mrz_info, 0, sizeof(mrz_info));
 	memset(kseed, 0, sizeof(kseed));
 	return TRUE;
 }
