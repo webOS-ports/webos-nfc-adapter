@@ -88,14 +88,17 @@ struct nfcd_client {
 
 	nfcd_state_cb state_cb;
 	nfcd_tag_cb tag_cb;
+	nfcd_hce_cb hce_cb;
 	void *user_data;
 
-	/* Card emulation: exported once, registered/unregistered as the
-	 * caller sets or clears a profile. See nfcd_client_set_card_emulation(). */
-	NfcdInterfaceLocalHostApp *hce_skeleton;
+	/* Card emulation: one struct hce_profile per registered AID, keyed
+	 * by its hex string. See nfcd_client_add_card_emulation_profile(). */
+	GHashTable *hce_profiles;
 	guint hce_mode_request_id;
-	GByteArray *hce_payload;
-	gboolean hce_registered;
+
+	/* Most recent reader-confirmed exchange, for getHceEvent */
+	gchar *hce_event_aid_hex;
+	gboolean hce_event_ok;
 };
 
 #define MIFARE_KEY_LEN 6
@@ -1425,13 +1428,14 @@ static void settings_vanished(GDBusConnection *connection, const gchar *name,
  */
 
 struct nfcd_client *nfcd_client_create(nfcd_state_cb state_cb, nfcd_tag_cb tag_cb,
-                                       void *user_data)
+                                       nfcd_hce_cb hce_cb, void *user_data)
 {
 	struct nfcd_client *client;
 
 	client = g_new0(struct nfcd_client, 1);
 	client->state_cb = state_cb;
 	client->tag_cb = tag_cb;
+	client->hce_cb = hce_cb;
 	client->user_data = user_data;
 	client->cancellable = g_cancellable_new();
 	client->mifare_key_cache = g_hash_table_new_full(g_str_hash, g_str_equal,
@@ -1483,14 +1487,10 @@ void nfcd_client_free(struct nfcd_client *client)
 	if (client->mifare_key_cache)
 		g_hash_table_unref(client->mifare_key_cache);
 
-	if (client->hce_skeleton) {
-		g_dbus_interface_skeleton_unexport(
-			G_DBUS_INTERFACE_SKELETON(client->hce_skeleton));
-		g_object_unref(client->hce_skeleton);
-	}
+	if (client->hce_profiles)
+		g_hash_table_unref(client->hce_profiles);
 
-	if (client->hce_payload)
-		g_byte_array_unref(client->hce_payload);
+	g_free(client->hce_event_aid_hex);
 
 	g_object_unref(client->cancellable);
 	g_free(client->adapter_path);
@@ -1499,14 +1499,28 @@ void nfcd_client_free(struct nfcd_client *client)
 }
 
 /*
- * Card emulation. We export an object implementing LocalHostApp; once
- * registered against an AID via Daemon.RegisterLocalHostApp, nfcd calls
- * into it when a reader selects that AID. Same AID-select/APDU-exchange
- * model Android's own HCE uses (HostApduService/CardEmulation - see
- * developer.android.com/develop/connectivity/nfc/hce), just a single
- * fixed response per profile rather than a general APDU service: this
- * is a personal-identifier/badge feature, not a card emulator.
+ * Card emulation. Each registered AID gets its own struct hce_profile,
+ * with its own LocalHostApp skeleton exported at a distinct object path
+ * and registered separately against nfcd - nfcd routes an incoming
+ * SELECT by AID to whichever registration matches, so several profiles
+ * can be active at once. Same AID-select/APDU-exchange model Android's
+ * own HCE uses (HostApduService/CardEmulation - see
+ * developer.android.com/develop/connectivity/nfc/hce). Process answers
+ * differently depending on INS (SELECT vs a read-style request) but
+ * still only ever returns one fixed payload per profile: this is a
+ * personal-identifier/badge feature, not a general APDU responder.
  */
+
+struct hce_profile {
+	struct nfcd_client *client;
+	gchar *aid_hex;
+	gchar *object_path;
+	NfcdInterfaceLocalHostApp *skeleton;
+	GByteArray *payload;
+	gboolean implicit;
+	gboolean registered;
+	guint next_response_id;
+};
 
 static gboolean hce_handle_start(NfcdInterfaceLocalHostApp *skeleton,
                                  GDBusMethodInvocation *invocation,
@@ -1556,26 +1570,52 @@ static gboolean hce_handle_deselect(NfcdInterfaceLocalHostApp *skeleton,
 	return TRUE;
 }
 
+/* ISO 7816-4 instruction bytes we distinguish; anything else gets
+ * "instruction not supported" rather than being treated as a read. */
+#define HCE_INS_SELECT		0xA4
+#define HCE_INS_READ_BINARY	0xB0
+#define HCE_INS_GET_DATA	0xCA
+
 static gboolean hce_handle_process(NfcdInterfaceLocalHostApp *skeleton,
                                    GDBusMethodInvocation *invocation,
                                    const gchar *host, guchar cla, guchar ins,
                                    guchar p1, guchar p2, GVariant *data,
                                    guint le, gpointer user_data)
 {
-	struct nfcd_client *client = user_data;
+	struct hce_profile *profile = user_data;
 	GVariant *response;
+	guchar sw1, sw2;
+	guint response_id;
 
-	/* Always the same fixed payload, regardless of what was asked -
-	 * see the comment above this section for why. */
-	if (client->hce_payload) {
-		response = g_variant_new_fixed_array(G_VARIANT_TYPE_BYTE,
-			client->hce_payload->data, client->hce_payload->len, 1);
-	} else {
+	switch (ins) {
+	case HCE_INS_SELECT:
+		/* Already routed to us by AID - just ack, no data to return. */
 		response = g_variant_new_fixed_array(G_VARIANT_TYPE_BYTE, NULL, 0, 1);
+		sw1 = 0x90;
+		sw2 = 0x00;
+		break;
+	case HCE_INS_READ_BINARY:
+	case HCE_INS_GET_DATA:
+		response = g_variant_new_fixed_array(G_VARIANT_TYPE_BYTE,
+			profile->payload->data, profile->payload->len, 1);
+		sw1 = 0x90;
+		sw2 = 0x00;
+		break;
+	default:
+		response = g_variant_new_fixed_array(G_VARIANT_TYPE_BYTE, NULL, 0, 1);
+		sw1 = 0x6D;
+		sw2 = 0x00;
+		break;
 	}
 
+	/* response_id 0 tells nfcd we don't want ResponseStatus - we do, so
+	 * hand out a non-zero, per-profile id (0 is never used, wrap included). */
+	response_id = ++profile->next_response_id;
+	if (!response_id)
+		response_id = ++profile->next_response_id;
+
 	nfcd_interface_local_host_app_complete_process(skeleton, invocation,
-		response, 0x90, 0x00, 0);
+		response, sw1, sw2, response_id);
 	return TRUE;
 }
 
@@ -1584,19 +1624,27 @@ static gboolean hce_handle_response_status(NfcdInterfaceLocalHostApp *skeleton,
                                            guint response_id, gboolean ok,
                                            gpointer user_data)
 {
-	/* We always complete Process synchronously with response_id 0, so
-	 * nfcd should never actually call this. */
+	struct hce_profile *profile = user_data;
+	struct nfcd_client *client = profile->client;
+
+	/* Record which AID a reader actually received a response for, so
+	 * nfcd_client_get_hce_event() can surface real confirmation instead
+	 * of firing blind. */
+	g_free(client->hce_event_aid_hex);
+	client->hce_event_aid_hex = g_strdup(profile->aid_hex);
+	client->hce_event_ok = ok;
+
+	if (client->hce_cb)
+		client->hce_cb(client, client->user_data);
+
 	nfcd_interface_local_host_app_complete_response_status(skeleton, invocation);
 	return TRUE;
 }
 
-static gboolean hce_export_skeleton(struct nfcd_client *client)
+static gboolean hce_export_skeleton(struct hce_profile *profile)
 {
 	GDBusConnection *connection;
 	GError *error = NULL;
-
-	if (client->hce_skeleton)
-		return TRUE;
 
 	connection = g_bus_get_sync(G_BUS_TYPE_SYSTEM, NULL, &error);
 	if (!connection) {
@@ -1605,34 +1653,35 @@ static gboolean hce_export_skeleton(struct nfcd_client *client)
 		return FALSE;
 	}
 
-	client->hce_skeleton = nfcd_interface_local_host_app_skeleton_new();
-	g_signal_connect(client->hce_skeleton, "handle-start",
-	                 G_CALLBACK(hce_handle_start), client);
-	g_signal_connect(client->hce_skeleton, "handle-restart",
-	                 G_CALLBACK(hce_handle_restart), client);
-	g_signal_connect(client->hce_skeleton, "handle-stop",
-	                 G_CALLBACK(hce_handle_stop), client);
-	g_signal_connect(client->hce_skeleton, "handle-implicit-select",
-	                 G_CALLBACK(hce_handle_implicit_select), client);
-	g_signal_connect(client->hce_skeleton, "handle-select",
-	                 G_CALLBACK(hce_handle_select), client);
-	g_signal_connect(client->hce_skeleton, "handle-deselect",
-	                 G_CALLBACK(hce_handle_deselect), client);
-	g_signal_connect(client->hce_skeleton, "handle-process",
-	                 G_CALLBACK(hce_handle_process), client);
-	g_signal_connect(client->hce_skeleton, "handle-response-status",
-	                 G_CALLBACK(hce_handle_response_status), client);
+	profile->skeleton = nfcd_interface_local_host_app_skeleton_new();
+	g_signal_connect(profile->skeleton, "handle-start",
+	                 G_CALLBACK(hce_handle_start), profile);
+	g_signal_connect(profile->skeleton, "handle-restart",
+	                 G_CALLBACK(hce_handle_restart), profile);
+	g_signal_connect(profile->skeleton, "handle-stop",
+	                 G_CALLBACK(hce_handle_stop), profile);
+	g_signal_connect(profile->skeleton, "handle-implicit-select",
+	                 G_CALLBACK(hce_handle_implicit_select), profile);
+	g_signal_connect(profile->skeleton, "handle-select",
+	                 G_CALLBACK(hce_handle_select), profile);
+	g_signal_connect(profile->skeleton, "handle-deselect",
+	                 G_CALLBACK(hce_handle_deselect), profile);
+	g_signal_connect(profile->skeleton, "handle-process",
+	                 G_CALLBACK(hce_handle_process), profile);
+	g_signal_connect(profile->skeleton, "handle-response-status",
+	                 G_CALLBACK(hce_handle_response_status), profile);
 
-	if (!g_dbus_interface_skeleton_export(G_DBUS_INTERFACE_SKELETON(client->hce_skeleton),
-	                                      connection, NFCD_HCE_OBJECT_PATH, &error)) {
-		g_warning("Failed to export card emulation object: %s", error->message);
+	if (!g_dbus_interface_skeleton_export(G_DBUS_INTERFACE_SKELETON(profile->skeleton),
+	                                      connection, profile->object_path, &error)) {
+		g_warning("Failed to export card emulation object %s: %s",
+		         profile->object_path, error->message);
 		g_error_free(error);
-		g_object_unref(client->hce_skeleton);
-		client->hce_skeleton = NULL;
+		g_object_unref(profile->skeleton);
+		profile->skeleton = NULL;
 	}
 
 	g_object_unref(connection);
-	return client->hce_skeleton != NULL;
+	return profile->skeleton != NULL;
 }
 
 static void hce_mode_ready(GObject *source, GAsyncResult *res, gpointer user_data)
@@ -1653,7 +1702,7 @@ static void hce_mode_ready(GObject *source, GAsyncResult *res, gpointer user_dat
 }
 
 struct hce_req {
-	struct nfcd_client *client;
+	struct hce_profile *profile;
 	nfcd_result_cb cb;
 	void *user_data;
 };
@@ -1665,8 +1714,8 @@ static void hce_register_ready(GObject *source, GAsyncResult *res, gpointer user
 	GError *error = NULL;
 
 	if (nfcd_interface_daemon_call_register_local_host_app_finish(daemon, res, &error)) {
-		if (req->client)
-			req->client->hce_registered = TRUE;
+		if (req->profile)
+			req->profile->registered = TRUE;
 		if (req->cb)
 			req->cb(TRUE, NULL, req->user_data);
 	} else {
@@ -1677,11 +1726,12 @@ static void hce_register_ready(GObject *source, GAsyncResult *res, gpointer user
 	g_free(req);
 }
 
-static void hce_do_register(struct nfcd_client *client, const GByteArray *aid,
-                            nfcd_result_cb cb, void *user_data)
+static void hce_do_register(struct nfcd_client *client, struct hce_profile *profile,
+                            const GByteArray *aid, nfcd_result_cb cb, void *user_data)
 {
 	struct hce_req *req;
 	GVariant *aid_variant;
+	guint flags = profile->implicit ? 0x01 : 0x00;
 
 	if (!client->daemon) {
 		if (cb)
@@ -1690,7 +1740,7 @@ static void hce_do_register(struct nfcd_client *client, const GByteArray *aid,
 	}
 
 	req = g_new0(struct hce_req, 1);
-	req->client = client;
+	req->profile = profile;
 	req->cb = cb;
 	req->user_data = user_data;
 
@@ -1701,69 +1751,172 @@ static void hce_do_register(struct nfcd_client *client, const GByteArray *aid,
 	aid_variant = g_variant_new_fixed_array(G_VARIANT_TYPE_BYTE,
 		aid->data, aid->len, 1);
 	nfcd_interface_daemon_call_register_local_host_app(client->daemon,
-		NFCD_HCE_OBJECT_PATH, NFCD_HCE_APP_NAME, aid_variant, 0,
+		profile->object_path, NFCD_HCE_APP_NAME, aid_variant, flags,
 		client->cancellable, hce_register_ready, req);
 }
 
-void nfcd_client_set_card_emulation(struct nfcd_client *client,
-                                    const GByteArray *aid, const GByteArray *payload,
-                                    nfcd_result_cb cb, void *user_data)
+static void hce_profile_free(gpointer data)
 {
+	struct hce_profile *profile = data;
+
+	if (profile->skeleton) {
+		g_dbus_interface_skeleton_unexport(G_DBUS_INTERFACE_SKELETON(profile->skeleton));
+		g_object_unref(profile->skeleton);
+	}
+	if (profile->payload)
+		g_byte_array_unref(profile->payload);
+	g_free(profile->object_path);
+	g_free(profile->aid_hex);
+	g_free(profile);
+}
+
+void nfcd_client_add_card_emulation_profile(struct nfcd_client *client,
+                                            const GByteArray *aid, const GByteArray *payload,
+                                            gboolean implicit,
+                                            nfcd_result_cb cb, void *user_data)
+{
+	struct hce_profile *profile;
+	gchar *aid_hex;
+
 	if (!aid || !aid->len) {
 		if (cb)
 			cb(FALSE, "AID is required", user_data);
 		return;
 	}
 
-	if (!hce_export_skeleton(client)) {
-		if (cb)
-			cb(FALSE, "Failed to export card emulation object", user_data);
+	if (!client->hce_profiles)
+		client->hce_profiles = g_hash_table_new_full(g_str_hash, g_str_equal,
+		                                             NULL, hce_profile_free);
+
+	aid_hex = ndef_bytes_to_hex(aid->data, aid->len);
+	profile = g_hash_table_lookup(client->hce_profiles, aid_hex);
+
+	if (profile) {
+		/* Already registered - update the payload in place, only
+		 * re-registering with nfcd if the implicit flag changed. */
+		gboolean flag_changed = (profile->implicit != implicit);
+
+		g_byte_array_set_size(profile->payload, 0);
+		if (payload && payload->len)
+			g_byte_array_append(profile->payload, payload->data, payload->len);
+		profile->implicit = implicit;
+		g_free(aid_hex);
+
+		if (flag_changed && client->daemon) {
+			nfcd_interface_daemon_call_unregister_local_host_app(client->daemon,
+				profile->object_path, client->cancellable, NULL, NULL);
+			profile->registered = FALSE;
+			hce_do_register(client, profile, aid, cb, user_data);
+		} else if (cb) {
+			cb(TRUE, NULL, user_data);
+		}
 		return;
 	}
 
-	if (client->hce_payload)
-		g_byte_array_unref(client->hce_payload);
-	client->hce_payload = g_byte_array_sized_new(payload ? payload->len : 0);
+	profile = g_new0(struct hce_profile, 1);
+	profile->client = client;
+	profile->aid_hex = aid_hex;
+	profile->object_path = g_strdup_printf("%s/%s", NFCD_HCE_OBJECT_PATH, aid_hex);
+	profile->payload = g_byte_array_sized_new(payload ? payload->len : 0);
 	if (payload && payload->len)
-		g_byte_array_append(client->hce_payload, payload->data, payload->len);
+		g_byte_array_append(profile->payload, payload->data, payload->len);
+	profile->implicit = implicit;
 
-	if (client->hce_registered && client->daemon) {
-		/* Re-registering with a (possibly) different AID - drop the
-		 * old registration first rather than leaving it ambiguous. */
-		nfcd_interface_daemon_call_unregister_local_host_app(client->daemon,
-			NFCD_HCE_OBJECT_PATH, client->cancellable, NULL, NULL);
-		client->hce_registered = FALSE;
+	if (!hce_export_skeleton(profile)) {
+		if (cb)
+			cb(FALSE, "Failed to export card emulation object", user_data);
+		hce_profile_free(profile);
+		return;
 	}
 
-	hce_do_register(client, aid, cb, user_data);
+	g_hash_table_insert(client->hce_profiles, profile->aid_hex, profile);
+	hce_do_register(client, profile, aid, cb, user_data);
 }
 
-void nfcd_client_clear_card_emulation(struct nfcd_client *client,
-                                      nfcd_result_cb cb, void *user_data)
+void nfcd_client_remove_card_emulation_profile(struct nfcd_client *client,
+                                               const GByteArray *aid,
+                                               nfcd_result_cb cb, void *user_data)
 {
-	if (!client->hce_registered || !client->daemon) {
+	struct hce_profile *profile;
+	gchar *aid_hex;
+
+	if (!aid || !aid->len) {
+		if (cb)
+			cb(FALSE, "AID is required", user_data);
+		return;
+	}
+
+	aid_hex = ndef_bytes_to_hex(aid->data, aid->len);
+	profile = client->hce_profiles ?
+		g_hash_table_lookup(client->hce_profiles, aid_hex) : NULL;
+
+	if (!profile) {
+		g_free(aid_hex);
 		if (cb)
 			cb(TRUE, NULL, user_data);
 		return;
 	}
 
-	nfcd_interface_daemon_call_unregister_local_host_app(client->daemon,
-		NFCD_HCE_OBJECT_PATH, client->cancellable, NULL, NULL);
-	client->hce_registered = FALSE;
+	if (profile->registered && client->daemon) {
+		/* nfcd also drops this on its own if our bus connection
+		 * goes away, same as every other resource it hands out. */
+		nfcd_interface_daemon_call_unregister_local_host_app(client->daemon,
+			profile->object_path, client->cancellable, NULL, NULL);
+	}
 
-	if (client->hce_mode_request_id) {
+	g_hash_table_remove(client->hce_profiles, aid_hex);
+	g_free(aid_hex);
+
+	if (g_hash_table_size(client->hce_profiles) == 0 &&
+	    client->hce_mode_request_id && client->daemon) {
 		nfcd_interface_daemon_call_release_mode(client->daemon,
 			client->hce_mode_request_id, client->cancellable, NULL, NULL);
 		client->hce_mode_request_id = 0;
 	}
 
-	if (client->hce_payload) {
-		g_byte_array_unref(client->hce_payload);
-		client->hce_payload = NULL;
+	if (cb)
+		cb(TRUE, NULL, user_data);
+}
+
+void nfcd_client_clear_card_emulation(struct nfcd_client *client,
+                                      nfcd_result_cb cb, void *user_data)
+{
+	GHashTableIter iter;
+	gpointer value;
+
+	if (client->hce_profiles) {
+		g_hash_table_iter_init(&iter, client->hce_profiles);
+		while (g_hash_table_iter_next(&iter, NULL, &value)) {
+			struct hce_profile *profile = value;
+
+			if (profile->registered && client->daemon)
+				nfcd_interface_daemon_call_unregister_local_host_app(client->daemon,
+					profile->object_path, client->cancellable, NULL, NULL);
+		}
+		g_hash_table_remove_all(client->hce_profiles);
+	}
+
+	if (client->hce_mode_request_id && client->daemon) {
+		nfcd_interface_daemon_call_release_mode(client->daemon,
+			client->hce_mode_request_id, client->cancellable, NULL, NULL);
+		client->hce_mode_request_id = 0;
 	}
 
 	if (cb)
 		cb(TRUE, NULL, user_data);
+}
+
+gboolean nfcd_client_get_hce_event(struct nfcd_client *client,
+                                   gchar **aid_hex_out, gboolean *ok_out)
+{
+	if (!client->hce_event_aid_hex)
+		return FALSE;
+
+	if (aid_hex_out)
+		*aid_hex_out = g_strdup(client->hce_event_aid_hex);
+	if (ok_out)
+		*ok_out = client->hce_event_ok;
+	return TRUE;
 }
 
 gboolean nfcd_client_is_available(struct nfcd_client *client)

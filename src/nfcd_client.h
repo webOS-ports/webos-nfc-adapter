@@ -43,11 +43,15 @@ typedef void (*nfcd_state_cb)(struct nfcd_client *client, void *user_data);
 /* The tag in the field changed: arrived and finished reading, or went away */
 typedef void (*nfcd_tag_cb)(struct nfcd_client *client, void *user_data);
 
+/* A reader confirmed it received a card-emulation response - see
+ * nfcd_client_get_hce_event(). */
+typedef void (*nfcd_hce_cb)(struct nfcd_client *client, void *user_data);
+
 /* Completion of a request that can fail */
 typedef void (*nfcd_result_cb)(gboolean success, const char *error_text, void *user_data);
 
 struct nfcd_client *nfcd_client_create(nfcd_state_cb state_cb, nfcd_tag_cb tag_cb,
-                                       void *user_data);
+                                       nfcd_hce_cb hce_cb, void *user_data);
 void nfcd_client_free(struct nfcd_client *client);
 
 /* True once nfcd is running and has published an adapter */
@@ -96,20 +100,43 @@ void nfcd_client_write_raw(struct nfcd_client *client, const GByteArray *raw_dat
 void nfcd_client_lock_tag(struct nfcd_client *client, nfcd_result_cb cb, void *user_data);
 
 /**
- * Registers a simple card-emulation profile: while active, this device
- * answers a reader that selects the given AID with the given static
- * payload (SW 90 00) for any APDU. Not a general APDU responder or relay -
- * one fixed response per profile, deliberately, so this can only be used
- * for something like a personal access-badge identifier, never to proxy
- * or clone a live card session. Takes ownership of nothing.
+ * Registers a simple card-emulation profile under the given AID: while
+ * active, this device answers a reader that selects that AID with the
+ * given static payload for a read-style APDU (SW 90 00), an empty ack for
+ * SELECT, and "instruction not supported" (SW 6D 00) for anything else.
+ * Several profiles can be active at once, one per distinct AID - a reader
+ * picks whichever it selects. implicit sets nfcd's "allow implicit
+ * selection" flag, so this profile can also be reached as the default
+ * when a reader skips an explicit AID-SELECT.
+ *
+ * Not a general APDU responder or relay - one fixed response per profile,
+ * deliberately, so this can only be used for something like a personal
+ * access-badge identifier, never to proxy or clone a live card session.
+ * Takes ownership of nothing. Re-adding an AID that's already registered
+ * replaces its payload/implicit flag.
  */
-void nfcd_client_set_card_emulation(struct nfcd_client *client,
-                                    const GByteArray *aid, const GByteArray *payload,
-                                    nfcd_result_cb cb, void *user_data);
+void nfcd_client_add_card_emulation_profile(struct nfcd_client *client,
+                                            const GByteArray *aid, const GByteArray *payload,
+                                            gboolean implicit,
+                                            nfcd_result_cb cb, void *user_data);
 
-/* Unregisters the profile set by nfcd_client_set_card_emulation(), if any */
+/* Unregisters one profile by AID */
+void nfcd_client_remove_card_emulation_profile(struct nfcd_client *client,
+                                               const GByteArray *aid,
+                                               nfcd_result_cb cb, void *user_data);
+
+/* Unregisters every profile added via nfcd_client_add_card_emulation_profile() */
 void nfcd_client_clear_card_emulation(struct nfcd_client *client,
                                       nfcd_result_cb cb, void *user_data);
+
+/**
+ * The most recent reader-confirmed card-emulation exchange: which AID was
+ * read and whether nfcd reports the response as successfully delivered.
+ * Returns FALSE (and leaves the out params untouched) if nothing has
+ * happened yet. The caller takes ownership of *aid_hex_out.
+ */
+gboolean nfcd_client_get_hce_event(struct nfcd_client *client,
+                                   gchar **aid_hex_out, gboolean *ok_out);
 
 #endif
 

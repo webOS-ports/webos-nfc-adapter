@@ -6,11 +6,13 @@
         "com.webos.service.nfc/writeTag",
         "com.webos.service.nfc/lockTag",
         "com.webos.service.nfc/cloneTag",
-        "com.webos.service.nfc/setCardEmulation",
+        "com.webos.service.nfc/addCardEmulationProfile",
+        "com.webos.service.nfc/removeCardEmulationProfile",
         "com.webos.service.nfc/clearCardEmulation"
     ],
     "nfc.query": [
         "com.webos.service.nfc/getStatus",
-        "com.webos.service.nfc/getTagInfo"
+        "com.webos.service.nfc/getTagInfo",
+        "com.webos.service.nfc/getCardEmulationEvent"
     ]
 }
