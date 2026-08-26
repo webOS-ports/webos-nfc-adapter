@@ -22,6 +22,7 @@
 #include "nfcd-interface.h"
 #include "nfcd_client.h"
 #include "ndef.h"
+#include "bac.h"
 
 #define NFCD_DAEMON_SERVICE		"org.sailfishos.nfc.daemon"
 #define NFCD_SETTINGS_SERVICE	"org.sailfishos.nfc.settings"
@@ -31,6 +32,11 @@
 
 /* NfcTag.type value for MIFARE Classic (nfc_types.h NFC_TAG_TYPE enum) */
 #define NFC_TAG_TYPE_MIFARE_CLASSIC	2
+
+/* org.sailfishos.nfc.Tag.xml protocol codes: ISO-DEP over NFC-A/-B - what
+ * ICAO 9303 eMRTD chips (passports, eIDs) activate as. */
+#define NFC_PROTOCOL_T4A	8
+#define NFC_PROTOCOL_T4B	16
 
 /* org.sailfishos.nfc.Daemon polling bit: see Daemon.xml */
 #define NFCD_MODE_READER_WRITER	0x02
@@ -75,8 +81,12 @@ struct nfcd_client {
 
 	gchar *tag_path;
 	gboolean tag_is_type2;
+	guint tag_protocol;		/* org.sailfishos.nfc.Tag.xml protocol code, see protocol_to_string() */
 	jvalue_ref tag_json;
 	struct tag_read *reading;
+
+	/* At most one passport BAC read at a time - see nfcd_client_read_passport() */
+	struct passport_read *passport_reading;
 
 	/* MIFARE Classic keys that worked before, by tag UID (hex string) ->
 	 * struct mifare_key_cache_entry*, so re-taps of the same physical
@@ -136,6 +146,25 @@ struct tag_read {
 	jvalue_ref mifare_blocks_arr;
 };
 
+/* One BAC passport/eID read: SELECT eMRTD app, GET CHALLENGE, MUTUAL
+ * AUTHENTICATE, then EF.DG1 under secure messaging. See bac.h. */
+struct passport_read {
+	struct nfcd_client *client;		/* NULL once orphaned */
+	NfcdInterfaceTag *tag;
+	GCancellable *cancellable;
+
+	BacStaticKeys keys;
+	BacChallenge challenge;
+	BacSession session;
+	guint8 rnd_icc[8];
+
+	GByteArray *dg1;		/* accumulated EF.DG1 bytes */
+	gsize dg1_total_len;		/* from the first 4 bytes' TLV header */
+
+	nfcd_passport_cb cb;
+	void *user_data;
+};
+
 struct write_req {
 	struct nfcd_client *client;
 	GByteArray *tlv;
@@ -167,6 +196,13 @@ static void mifare_read_block(struct tag_read *read, guint block);
 static void mifare_sector_done(struct tag_read *read);
 static void mifare_publish_progress(struct tag_read *read);
 static gboolean mifare_try_cached_key(struct tag_read *read);
+
+static void passport_read_abort(struct passport_read *read);
+static void passport_select_aid_ready(GObject *source, GAsyncResult *res, gpointer user_data);
+static void passport_get_challenge_ready(GObject *source, GAsyncResult *res, gpointer user_data);
+static void passport_mutual_auth_ready(GObject *source, GAsyncResult *res, gpointer user_data);
+static void passport_select_dg1_ready(GObject *source, GAsyncResult *res, gpointer user_data);
+static void passport_dg1_rest_ready(GObject *source, GAsyncResult *res, gpointer user_data);
 
 static void notify_state(struct nfcd_client *client)
 {
@@ -927,6 +963,8 @@ static void tag_get_all_ready(GObject *source, GAsyncResult *res, gpointer user_
 	jobject_put(read->tag_obj, J_CSTR_TO_JVAL("pollParameters"),
 	            variant_dict_to_json(poll_parameters));
 
+	read->client->tag_protocol = protocol;
+
 	for (n = 0; interfaces && interfaces[n]; n++) {
 		if (!g_strcmp0(interfaces[n], TAG_IFACE_TYPE2))
 			read->is_type2 = TRUE;
@@ -1002,6 +1040,418 @@ static void tag_read_start(struct nfcd_client *client, const char *path)
 	                                     read->cancellable, tag_proxy_ready, read);
 }
 
+/*
+ * Passport/eID BAC read. Unlike tag_read (which backs a polling cache no
+ * single caller blocks on), this backs one direct readPassport() call, so
+ * every exit path below calls back rather than silently orphaning - see
+ * passport_read_finish(). Sequence: SELECT eMRTD app, GET CHALLENGE,
+ * MUTUAL AUTHENTICATE, then EF.DG1 under secure messaging (SELECT + one or
+ * more READ BINARY). At most one outstanding Transceive() at a time.
+ */
+
+#define PASSPORT_EMRTD_FID_HI	0x01
+#define PASSPORT_EMRTD_FID_LO	0x01
+#define PASSPORT_DG1_MAX_LEN	2048	/* generous sanity ceiling, not a real limit */
+
+static void passport_dg1_read_more(struct passport_read *read);
+
+static void passport_read_free(struct passport_read *read)
+{
+	if (!read)
+		return;
+
+	if (read->tag)
+		g_object_unref(read->tag);
+
+	if (read->cancellable)
+		g_object_unref(read->cancellable);
+
+	if (read->dg1)
+		g_byte_array_free(read->dg1, TRUE);
+
+	memset(&read->keys, 0, sizeof(read->keys));
+	memset(&read->session, 0, sizeof(read->session));
+	g_free(read);
+}
+
+/* The only place that invokes the caller's callback - every step below
+ * ends here exactly once, success or failure. */
+static void passport_read_finish(struct passport_read *read, gboolean success,
+                                 const char *error_text, const char *mrz_text)
+{
+	nfcd_passport_cb cb = read->cb;
+	void *user_data = read->user_data;
+
+	if (read->client && read->client->passport_reading == read)
+		read->client->passport_reading = NULL;
+
+	passport_read_free(read);
+
+	if (cb)
+		cb(success, error_text, mrz_text, user_data);
+}
+
+/* Detaches from a client that's going away (torn down, or the tag in the
+ * field changed) - the in-flight Transceive() still completes normally
+ * (cancelled), and that callback is what actually calls passport_read_finish(). */
+static void passport_read_abort(struct passport_read *read)
+{
+	if (!read)
+		return;
+
+	read->client = NULL;
+	g_cancellable_cancel(read->cancellable);
+}
+
+/* A raw (pre-secure-messaging) APDU response: expect_data_len bytes of
+ * data followed by SW1SW2 = 90 00. *data_out points into resp itself. */
+static gboolean passport_raw_response_ok(const guint8 *resp, gsize len, gsize expect_data_len,
+                                         const guint8 **data_out)
+{
+	if (len != expect_data_len + 2)
+		return FALSE;
+	if (resp[len - 2] != 0x90 || resp[len - 1] != 0x00)
+		return FALSE;
+	if (data_out)
+		*data_out = resp;
+	return TRUE;
+}
+
+static void passport_transceive(struct passport_read *read, GByteArray *apdu,
+                                GAsyncReadyCallback callback)
+{
+	GVariant *data = g_variant_new_fixed_array(G_VARIANT_TYPE_BYTE, apdu->data, apdu->len, 1);
+
+	nfcd_interface_tag_call_transceive(read->tag, data, read->cancellable, callback, read);
+	g_byte_array_free(apdu, TRUE);
+}
+
+static void passport_tag_proxy_ready(GObject *source, GAsyncResult *res, gpointer user_data)
+{
+	struct passport_read *read = user_data;
+	GError *error = NULL;
+
+	read->tag = nfcd_interface_tag_proxy_new_for_bus_finish(res, &error);
+
+	if (!read->tag) {
+		g_error_free(error);
+		passport_read_finish(read, FALSE, "Failed to reach the tag", NULL);
+		return;
+	}
+
+	passport_transceive(read, bac_build_select_aid(), passport_select_aid_ready);
+}
+
+static void passport_select_aid_ready(GObject *source, GAsyncResult *res, gpointer user_data)
+{
+	struct passport_read *read = user_data;
+	GError *error = NULL;
+	GVariant *response = NULL;
+	gboolean ok;
+	GByteArray *apdu;
+
+	ok = nfcd_interface_tag_call_transceive_finish(NFCD_INTERFACE_TAG(source),
+	                                               &response, res, &error);
+	if (!ok) {
+		g_error_free(error);
+		passport_read_finish(read, FALSE, "Failed to reach the tag", NULL);
+		return;
+	}
+
+	{
+		gsize len = 0;
+		const guint8 *bytes = g_variant_get_fixed_array(response, &len, 1);
+
+		if (!passport_raw_response_ok(bytes, len, 0, NULL)) {
+			g_variant_unref(response);
+			passport_read_finish(read, FALSE,
+				"Not an ICAO 9303 document (eMRTD application not found)", NULL);
+			return;
+		}
+		g_variant_unref(response);
+	}
+
+	apdu = bac_build_get_challenge();
+	passport_transceive(read, apdu, passport_get_challenge_ready);
+}
+
+static void passport_get_challenge_ready(GObject *source, GAsyncResult *res, gpointer user_data)
+{
+	struct passport_read *read = user_data;
+	GError *error = NULL;
+	GVariant *response = NULL;
+	gboolean ok;
+	GByteArray *apdu;
+
+	ok = nfcd_interface_tag_call_transceive_finish(NFCD_INTERFACE_TAG(source),
+	                                               &response, res, &error);
+	if (!ok) {
+		g_error_free(error);
+		passport_read_finish(read, FALSE, "Failed to reach the tag", NULL);
+		return;
+	}
+
+	{
+		gsize len = 0;
+		const guint8 *bytes = g_variant_get_fixed_array(response, &len, 1);
+		const guint8 *data;
+
+		if (!passport_raw_response_ok(bytes, len, 8, &data)) {
+			g_variant_unref(response);
+			passport_read_finish(read, FALSE, "GET CHALLENGE failed", NULL);
+			return;
+		}
+		memcpy(read->rnd_icc, data, 8);
+		g_variant_unref(response);
+	}
+
+	apdu = bac_build_mutual_authenticate(&read->keys, read->rnd_icc, &read->challenge);
+	if (!apdu) {
+		passport_read_finish(read, FALSE, "Failed to generate a random challenge", NULL);
+		return;
+	}
+	passport_transceive(read, apdu, passport_mutual_auth_ready);
+}
+
+static void passport_mutual_auth_ready(GObject *source, GAsyncResult *res, gpointer user_data)
+{
+	struct passport_read *read = user_data;
+	GError *error = NULL;
+	GVariant *response = NULL;
+	gboolean ok;
+	GByteArray *apdu;
+	guint8 fid[2] = { PASSPORT_EMRTD_FID_HI, PASSPORT_EMRTD_FID_LO };
+
+	ok = nfcd_interface_tag_call_transceive_finish(NFCD_INTERFACE_TAG(source),
+	                                               &response, res, &error);
+	if (!ok) {
+		g_error_free(error);
+		passport_read_finish(read, FALSE, "Failed to reach the tag", NULL);
+		return;
+	}
+
+	{
+		gsize len = 0;
+		const guint8 *bytes = g_variant_get_fixed_array(response, &len, 1);
+		const guint8 *data;
+
+		if (!passport_raw_response_ok(bytes, len, 40, &data)) {
+			g_variant_unref(response);
+			passport_read_finish(read, FALSE,
+				"BAC authentication rejected - check the document number, date "
+				"of birth and date of expiry, or this document may need PACE "
+				"instead of BAC", NULL);
+			return;
+		}
+
+		if (!bac_process_mutual_authenticate_response(&read->keys, &read->challenge,
+		                                              read->rnd_icc, data, 40,
+		                                              &read->session)) {
+			g_variant_unref(response);
+			passport_read_finish(read, FALSE,
+				"BAC authentication response could not be verified", NULL);
+			return;
+		}
+		g_variant_unref(response);
+	}
+
+	apdu = bac_sm_protect(&read->session, 0x00, 0xA4, 0x02, 0x0C, fid, sizeof(fid), -1);
+	if (!apdu) {
+		passport_read_finish(read, FALSE, "Failed to build the secure messaging command", NULL);
+		return;
+	}
+	passport_transceive(read, apdu, passport_select_dg1_ready);
+}
+
+/* Common to every step after MUTUAL AUTHENTICATE: unwrap the response,
+ * fail on a MAC mismatch or a non-9000 status. *plaintext_out is NULL when
+ * ok is TRUE and the step had no data to return (e.g. after SELECT). */
+static gboolean passport_sm_response_ok(struct passport_read *read, GVariant *response,
+                                        GByteArray **plaintext_out, const char **error_out)
+{
+	gsize len = 0;
+	const guint8 *bytes = g_variant_get_fixed_array(response, &len, 1);
+	guint16 sw = 0;
+
+	*plaintext_out = NULL;
+
+	if (!bac_sm_unprotect(&read->session, bytes, len, plaintext_out, &sw)) {
+		*error_out = "Secure messaging integrity check failed";
+		return FALSE;
+	}
+	if (sw != 0x9000) {
+		if (*plaintext_out)
+			g_byte_array_free(*plaintext_out, TRUE);
+		*plaintext_out = NULL;
+		*error_out = "The document rejected a secure messaging command";
+		return FALSE;
+	}
+	return TRUE;
+}
+
+static void passport_select_dg1_ready(GObject *source, GAsyncResult *res, gpointer user_data)
+{
+	struct passport_read *read = user_data;
+	GError *error = NULL;
+	GVariant *response = NULL;
+	gboolean ok;
+	GByteArray *plaintext = NULL;
+	const char *error_text = NULL;
+	GByteArray *apdu;
+
+	ok = nfcd_interface_tag_call_transceive_finish(NFCD_INTERFACE_TAG(source),
+	                                               &response, res, &error);
+	if (!ok) {
+		g_error_free(error);
+		passport_read_finish(read, FALSE, "Failed to reach the tag", NULL);
+		return;
+	}
+
+	ok = passport_sm_response_ok(read, response, &plaintext, &error_text);
+	g_variant_unref(response);
+	if (plaintext)
+		g_byte_array_free(plaintext, TRUE); /* SELECT returns no data */
+
+	if (!ok) {
+		passport_read_finish(read, FALSE,
+			error_text ? error_text :
+			"Failed to select the MRZ data group (EF.DG1) - this document "
+			"may not support BAC reading of DG1", NULL);
+		return;
+	}
+
+	read->dg1 = g_byte_array_new();
+	apdu = bac_sm_protect(&read->session, 0x00, 0xB0, 0x00, 0x00, NULL, 0, 4);
+	if (!apdu) {
+		passport_read_finish(read, FALSE, "Failed to build the secure messaging command", NULL);
+		return;
+	}
+	passport_transceive(read, apdu, passport_dg1_rest_ready);
+}
+
+static void passport_dg1_rest_ready(GObject *source, GAsyncResult *res, gpointer user_data)
+{
+	struct passport_read *read = user_data;
+	GError *error = NULL;
+	GVariant *response = NULL;
+	gboolean ok;
+	GByteArray *plaintext = NULL;
+	const char *error_text = NULL;
+
+	ok = nfcd_interface_tag_call_transceive_finish(NFCD_INTERFACE_TAG(source),
+	                                               &response, res, &error);
+	if (!ok) {
+		g_error_free(error);
+		passport_read_finish(read, FALSE, "Failed to reach the tag", NULL);
+		return;
+	}
+
+	ok = passport_sm_response_ok(read, response, &plaintext, &error_text);
+	g_variant_unref(response);
+
+	if (!ok || !plaintext) {
+		if (plaintext)
+			g_byte_array_free(plaintext, TRUE);
+		passport_read_finish(read, FALSE,
+			error_text ? error_text : "Failed to read the MRZ data group (EF.DG1)", NULL);
+		return;
+	}
+
+	g_byte_array_append(read->dg1, plaintext->data, plaintext->len);
+	g_byte_array_free(plaintext, TRUE);
+
+	if (read->dg1_total_len == 0) {
+		/* This was the first chunk - now enough header is in hand to know
+		 * the file's real length. */
+		gsize header_len, content_len;
+
+		if (!bac_ber_tlv_header(read->dg1->data, read->dg1->len, &header_len, &content_len) ||
+		    header_len + content_len > PASSPORT_DG1_MAX_LEN) {
+			passport_read_finish(read, FALSE,
+				"The MRZ data group (EF.DG1) has an unexpected structure", NULL);
+			return;
+		}
+		read->dg1_total_len = header_len + content_len;
+	}
+
+	passport_dg1_read_more(read);
+}
+
+static void passport_dg1_read_more(struct passport_read *read)
+{
+	gsize remaining = read->dg1_total_len - read->dg1->len;
+	gsize chunk;
+	guint offset;
+	GByteArray *apdu;
+	gchar *mrz;
+
+	if (remaining == 0) {
+		mrz = bac_parse_dg1_mrz(read->dg1->data, read->dg1->len);
+		if (!mrz) {
+			passport_read_finish(read, FALSE,
+				"Could not parse the MRZ data group (EF.DG1)", NULL);
+			return;
+		}
+		passport_read_finish(read, TRUE, NULL, mrz);
+		g_free(mrz);
+		return;
+	}
+
+	chunk = MIN(remaining, 255);
+	offset = (guint) read->dg1->len;
+
+	apdu = bac_sm_protect(&read->session, 0x00, 0xB0, (guint8)(offset >> 8),
+	                      (guint8)(offset & 0xFF), NULL, 0, (gint) chunk);
+	if (!apdu) {
+		passport_read_finish(read, FALSE, "Failed to build the secure messaging command", NULL);
+		return;
+	}
+	passport_transceive(read, apdu, passport_dg1_rest_ready);
+}
+
+void nfcd_client_read_passport(struct nfcd_client *client, const char *document_number,
+                               const char *date_of_birth, const char *date_of_expiry,
+                               nfcd_passport_cb cb, void *user_data)
+{
+	struct passport_read *read;
+	BacStaticKeys keys;
+
+	if (client->passport_reading) {
+		cb(FALSE, "A passport read is already in progress", NULL, user_data);
+		return;
+	}
+
+	if (!client->tag_path) {
+		cb(FALSE, "No tag in the field", NULL, user_data);
+		return;
+	}
+
+	if (client->tag_protocol != NFC_PROTOCOL_T4A && client->tag_protocol != NFC_PROTOCOL_T4B) {
+		cb(FALSE, "Not an ISO-DEP tag - passports and eIDs need ISO-DEP (t4a/t4b)",
+		  NULL, user_data);
+		return;
+	}
+
+	if (!bac_derive_static_keys(document_number, date_of_birth, date_of_expiry, &keys)) {
+		cb(FALSE, "Expected documentNumber, dateOfBirth and dateOfExpiry (YYMMDD)",
+		  NULL, user_data);
+		return;
+	}
+
+	read = g_new0(struct passport_read, 1);
+	read->client = client;
+	read->keys = keys;
+	read->cancellable = g_cancellable_new();
+	read->cb = cb;
+	read->user_data = user_data;
+
+	client->passport_reading = read;
+
+	nfcd_interface_tag_proxy_new_for_bus(G_BUS_TYPE_SYSTEM, G_DBUS_PROXY_FLAGS_NONE,
+	                                     NFCD_DAEMON_SERVICE, client->tag_path,
+	                                     read->cancellable, passport_tag_proxy_ready, read);
+}
+
 static void set_current_tag(struct nfcd_client *client, const char *path)
 {
 	if (!g_strcmp0(client->tag_path, path))
@@ -1012,9 +1462,15 @@ static void set_current_tag(struct nfcd_client *client, const char *path)
 		client->reading = NULL;
 	}
 
+	if (client->passport_reading) {
+		passport_read_abort(client->passport_reading);
+		client->passport_reading = NULL;
+	}
+
 	g_free(client->tag_path);
 	client->tag_path = g_strdup(path);
 	client->tag_is_type2 = FALSE;
+	client->tag_protocol = 0;
 
 	if (client->tag_json) {
 		j_release(&client->tag_json);
@@ -1450,6 +1906,11 @@ void nfcd_client_free(struct nfcd_client *client)
 	if (client->reading) {
 		tag_read_abort(client->reading);
 		client->reading = NULL;
+	}
+
+	if (client->passport_reading) {
+		passport_read_abort(client->passport_reading);
+		client->passport_reading = NULL;
 	}
 
 	if (client->daemon_watch)
