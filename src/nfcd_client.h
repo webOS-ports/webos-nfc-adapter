@@ -150,6 +150,14 @@ void nfcd_client_read_passport(struct nfcd_client *client, const char *document_
                                nfcd_passport_cb cb, void *user_data);
 
 /**
+ * Same read, but via PACE (using the document's printed CAN) instead of
+ * BAC - the path documents that reject nfcd_client_read_passport() with
+ * "instead of BAC" need. Same failure-mode guarantees as above.
+ */
+void nfcd_client_read_passport_pace(struct nfcd_client *client, const char *can,
+                                    nfcd_passport_cb cb, void *user_data);
+
+/**
  * The most recent reader-confirmed card-emulation exchange: which AID was
  * read and whether nfcd reports the response as successfully delivered.
  * Returns FALSE (and leaves the out params untouched) if nothing has

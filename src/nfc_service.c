@@ -656,6 +656,43 @@ static bool _service_read_passport_cb(LSHandle *handle, LSMessage *message, void
 	return true;
 }
 
+/*
+ * Same result shape as readPassport, but via PACE (the CAN printed on the
+ * document) - what documents that reject readPassport with an
+ * "instead of BAC" error need instead. A separate method rather than a
+ * fallback inside readPassport: the two need different input (a CAN, not
+ * three MRZ fields) and the caller (who's holding the document and can
+ * see which one is printed on it) already knows which applies.
+ */
+static bool _service_read_passport_pace_cb(LSHandle *handle, LSMessage *message, void *user_data)
+{
+	struct nfc_service *service = user_data;
+	jvalue_ref parsed_obj = NULL;
+	gchar *can = NULL;
+
+	parsed_obj = luna_service_message_parse_and_validate(LSMessageGetPayload(message));
+	if (!parsed_obj) {
+		luna_service_message_reply_error_bad_json(handle, message);
+		return true;
+	}
+
+	can = get_string_param(parsed_obj, "can");
+	j_release(&parsed_obj);
+
+	if (!can) {
+		luna_service_message_reply_custom_error(handle, message,
+			"Expected can, the Card Access Number printed on the document");
+		return true;
+	}
+
+	nfcd_client_read_passport_pace(service->client, can,
+	                               read_passport_result_cb, nfc_request_new(handle, message));
+
+	g_free(can);
+
+	return true;
+}
+
 static LSMethod _nfc_service_methods[] = {
 	{ "getStatus", _service_get_status_cb },
 	{ "setEnabled", _service_set_enabled_cb },
@@ -664,6 +701,7 @@ static LSMethod _nfc_service_methods[] = {
 	{ "lockTag", _service_lock_tag_cb },
 	{ "cloneTag", _service_clone_tag_cb },
 	{ "readPassport", _service_read_passport_cb },
+	{ "readPassportPACE", _service_read_passport_pace_cb },
 	{ "addCardEmulationProfile", _service_add_card_emulation_cb },
 	{ "removeCardEmulationProfile", _service_remove_card_emulation_cb },
 	{ "clearCardEmulation", _service_clear_card_emulation_cb },

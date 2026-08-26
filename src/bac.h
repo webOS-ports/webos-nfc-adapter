@@ -20,6 +20,7 @@
 #define BAC_H_
 
 #include <glib.h>
+#include <openssl/sha.h>
 
 /*
  * ICAO Doc 9303 Part 11 Basic Access Control: derive the document's own
@@ -57,6 +58,16 @@ typedef struct {
  */
 gboolean bac_derive_static_keys(const char *document_number, const char *date_of_birth,
                                 const char *date_of_expiry, BacStaticKeys *keys_out);
+
+/*
+ * SHA-1(document number || its check digit || DOB || its check digit ||
+ * expiry || its check digit) - the "MRZ information" digest 9303-9's PACE
+ * password encoding (Table 5) and BAC's key seed (9.7.1) both build from.
+ * BAC then truncates this to 16 bytes itself; PACE (see pace.c) uses the
+ * full 20-byte digest as-is. Exported so pace.c doesn't duplicate this.
+ */
+gboolean bac_mrz_sha1(const char *document_number, const char *date_of_birth,
+                      const char *date_of_expiry, guint8 out[SHA_DIGEST_LENGTH]);
 
 /* SELECT the eMRTD application (AID A0000002471001) */
 GByteArray *bac_build_select_aid(void);
