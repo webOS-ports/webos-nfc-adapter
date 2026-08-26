@@ -944,16 +944,20 @@ gboolean pace_sm_unprotect(PaceSession *session, const guint8 *rapdu, gsize rapd
 
 	while (pos + 2 <= rapdu_len) {
 		guint8 tag = rapdu[pos];
-		guint8 clen = rapdu[pos + 1]; /* short-form only - PACE reads never exceed this */
+		gsize hlen, clen;
 
-		if (clen >= 0x80 || pos + 2 + clen > rapdu_len)
+		/* BER length, not short-form-only - DO'87' for anything past a
+		 * small DG1-sized read (e.g. DG2's photo) needs long form. */
+		if (!bac_ber_tlv_header(rapdu + pos, rapdu_len - pos, &hlen, &clen))
+			return FALSE;
+		if (pos + hlen + clen > rapdu_len)
 			return FALSE;
 
-		if (tag == 0x87) { do87 = rapdu + pos; do87_len = 2 + clen; }
-		else if (tag == 0x99) { do99 = rapdu + pos; do99_len = 2 + clen; }
-		else if (tag == 0x8E) { do8e = rapdu + pos; do8e_len = 2 + clen; }
+		if (tag == 0x87) { do87 = rapdu + pos; do87_len = hlen + clen; }
+		else if (tag == 0x99) { do99 = rapdu + pos; do99_len = hlen + clen; }
+		else if (tag == 0x8E) { do8e = rapdu + pos; do8e_len = hlen + clen; }
 
-		pos += 2 + clen;
+		pos += hlen + clen;
 	}
 
 	if (!do99 || do99_len != 4 || !do8e || do8e_len != 2 + 8)
@@ -984,16 +988,18 @@ gboolean pace_sm_unprotect(PaceSession *session, const guint8 *rapdu, gsize rapd
 	*sw_out = (guint16)((do99[2] << 8) | do99[3]);
 
 	if (do87) {
-		guint8 clen = do87[1];
+		gsize hlen, clen;
 		const guint8 *enc;
 		gsize enc_len;
 		guint8 iv[AES_BLOCK_LEN], *dec;
 		gsize i;
 
-		if (clen < 1 || do87[2] != 0x01)
+		if (!bac_ber_tlv_header(do87, do87_len, &hlen, &clen) || clen < 1)
+			return FALSE;
+		if (do87[hlen] != 0x01)
 			return FALSE;
 
-		enc = do87 + 3;
+		enc = do87 + hlen + 1;
 		enc_len = clen - 1;
 		if (enc_len == 0 || enc_len % AES_BLOCK_LEN != 0)
 			return FALSE;
