@@ -27,13 +27,23 @@
 #include "bac.h"
 #include "pace.h"
 
-#define AES_BLOCK_LEN	16
-#define EC_COORD_LEN	32	/* brainpoolP256r1 field element size */
-#define EC_PUB_LEN	(1 + 2 * EC_COORD_LEN)	/* uncompressed point, 0x04 || x || y */
+#define AES_BLOCK_LEN		16	/* fixed AES block size - independent of key length */
+#define PACE_COORD_LEN_MAX	40	/* brainpoolP320r1 field element size - the widest curve below */
+#define PACE_PUB_LEN_MAX	(1 + 2 * PACE_COORD_LEN_MAX)	/* uncompressed point, 0x04 || x || y */
+/* TR-03110-3 A.3.3: the nonce s is "a multiple of the block size", not
+ * necessarily one block - real AES-256 documents use a 256-bit (2-block)
+ * nonce (confirmed against real hardware: a captured GET NONCE response
+ * was 32 bytes, not 16). 4 blocks is generous headroom over every
+ * documented profile up to AES-256; anything longer is rejected rather
+ * than silently truncated or over-allocated for an untrusted chip claim. */
+#define PACE_NONCE_LEN_MAX	(4 * AES_BLOCK_LEN)
 
-/* id-PACE-ECDH-GM-AES-CBC-CMAC-128, ICAO 9303 Supplement Appendix G.1.1 /
- * BSI TR-03110 - the one PACEInfo variant this file implements. */
-static const guint8 pace_oid[] = { 0x04, 0x00, 0x7F, 0x00, 0x07, 0x02, 0x02, 0x04, 0x02, 0x02 };
+/* id-PACE-ECDH-GM-AES-CBC-CMAC-{128,256}, BSI TR-03110-3 Table 7 / ICAO
+ * 9303 Supplement Appendix G.1.1 - the two PACEInfo variants this file
+ * implements (arc suffix 2/4; suffix 3, AES-192, isn't). Only the last
+ * byte differs, so oid_len is shared. */
+static const guint8 pace_oid_aes128[] = { 0x04, 0x00, 0x7F, 0x00, 0x07, 0x02, 0x02, 0x04, 0x02, 0x02 };
+static const guint8 pace_oid_aes256[] = { 0x04, 0x00, 0x7F, 0x00, 0x07, 0x02, 0x02, 0x04, 0x02, 0x04 };
 
 /* id-PACE = 0.4.0.127.0.7.2.2.4 - every PACEInfo OID (any mapping, any
  * cipher) starts with this; used to pick SecurityInfo entries worth
@@ -41,9 +51,22 @@ static const guint8 pace_oid[] = { 0x04, 0x00, 0x7F, 0x00, 0x07, 0x02, 0x02, 0x0
  * like Chip/Terminal Authentication). */
 static const guint8 id_pace_prefix[] = { 0x04, 0x00, 0x7F, 0x00, 0x07, 0x02, 0x02, 0x04 };
 
+/* 0 if oid isn't one of the variants above - the one place that decides
+ * which OIDs this file accepts; pace_oid_supported() and
+ * pace_exchange_new() both go through this instead of duplicating the
+ * comparison. */
+static gsize pace_key_len_for_oid(const guint8 *oid, gsize oid_len)
+{
+	if (oid_len == sizeof(pace_oid_aes128) && memcmp(oid, pace_oid_aes128, oid_len) == 0)
+		return 16;
+	if (oid_len == sizeof(pace_oid_aes256) && memcmp(oid, pace_oid_aes256, oid_len) == 0)
+		return 32;
+	return 0;
+}
+
 gboolean pace_oid_supported(const guint8 *oid, gsize oid_len)
 {
-	return oid_len == sizeof(pace_oid) && memcmp(oid, pace_oid, oid_len) == 0;
+	return pace_key_len_for_oid(oid, oid_len) != 0;
 }
 
 int pace_ec_curve_for_parameter_id(gint parameter_id)
@@ -51,7 +74,8 @@ int pace_ec_curve_for_parameter_id(gint parameter_id)
 	switch (parameter_id) {
 	case 12: return NID_X9_62_prime256v1;	/* NIST P-256 / secp256r1 */
 	case 13: return NID_brainpoolP256r1;
-	default: return 0;	/* everything else needs a field width this file isn't sized for */
+	case 14: return NID_brainpoolP320r1;
+	default: return 0;	/* DH IDs, or an EC curve nothing here has been tried against */
 	}
 }
 
@@ -132,28 +156,41 @@ gsize pace_parse_card_access(const guint8 *data, gsize len, PaceInfoEntry *entri
 }
 
 struct PaceExchange {
-	guint8 kpi[PACE_KEY_LEN];
-	guint8 nonce_s[AES_BLOCK_LEN];
+	guint8 oid[16];
+	gsize oid_len;
+	gsize key_len;		/* 16 (AES-128) or 32 (AES-256) - from the negotiated oid */
+
+	guint8 kpi[PACE_KEY_LEN_MAX];
+	guint8 nonce_s[PACE_NONCE_LEN_MAX];
+	gsize nonce_len;	/* chip-chosen; a multiple of AES_BLOCK_LEN (see PACE_NONCE_LEN_MAX) */
+
+	gsize coord_len;	/* EC field element size for `group` (and group2): 32 or 40 */
+	gsize pub_len;		/* 1 + 2*coord_len */
 
 	BN_CTX *ctx;
-	EC_GROUP *group;	/* standardized brainpoolP256r1 */
+	EC_GROUP *group;	/* the negotiated curve (see pace_ec_curve_for_parameter_id()) */
 	BIGNUM *priv1;		/* round 2: our ephemeral mapping key */
 	EC_GROUP *group2;	/* round 2 result: same curve, generator G~ */
 	BIGNUM *priv2;		/* round 3: our ephemeral key-agreement key */
-	guint8 my_pub2[EC_PUB_LEN];
-	guint8 chip_pub2[EC_PUB_LEN];
+	guint8 my_pub2[PACE_PUB_LEN_MAX];
+	guint8 chip_pub2[PACE_PUB_LEN_MAX];
 
 	PaceSession session;	/* usable once round 3 completes */
 };
 
-/* ---- KDF: TR-03110 A.2.3 - SHA-1(K || r || c), no DES parity (that's a
- * 3DES/BAC-specific extra step - see bac.c's kdf(), which this is not). K
- * is whatever-length here (a CAN string or a 20-byte MRZ digest), unlike
- * BAC's always-16-byte kseed, so this can't just call bac.c's version. ---- */
-static void pace_kdf(const guint8 *k, gsize k_len, guint32 c, guint8 out[PACE_KEY_LEN])
+/* ---- KDF: TR-03110 A.2.3/A.2.3.2 - keydata = H(K || r || c) (r is empty
+ * for PACE; that's a Chip Authentication v2 thing), no DES parity (that's
+ * a 3DES/BAC-specific extra step - see bac.c's kdf(), which this is not).
+ * H and the truncation both depend on the target key length: 128-bit AES
+ * keys use SHA-1 and the first 16 bytes; 192/256-bit keys use SHA-256, and
+ * for 256-bit the full digest *is* the key (32 bytes in, 32 out - nothing
+ * to truncate). K is whatever-length here (a CAN string or a 20-byte MRZ
+ * digest), unlike BAC's always-16-byte kseed, so this can't just call
+ * bac.c's version. ---- */
+static void pace_kdf(const guint8 *k, gsize k_len, guint32 c, gsize key_len,
+                     guint8 out[PACE_KEY_LEN_MAX])
 {
 	guint8 *d = g_malloc(k_len + 4);
-	guint8 digest[SHA_DIGEST_LENGTH];
 
 	memcpy(d, k, k_len);
 	d[k_len + 0] = (guint8)(c >> 24);
@@ -161,8 +198,17 @@ static void pace_kdf(const guint8 *k, gsize k_len, guint32 c, guint8 out[PACE_KE
 	d[k_len + 2] = (guint8)(c >> 8);
 	d[k_len + 3] = (guint8)(c);
 
-	SHA1(d, k_len + 4, digest);
-	memcpy(out, digest, PACE_KEY_LEN);
+	if (key_len == 16) {
+		guint8 digest[SHA_DIGEST_LENGTH];
+
+		SHA1(d, k_len + 4, digest);
+		memcpy(out, digest, 16);
+	} else {
+		guint8 digest[SHA256_DIGEST_LENGTH];
+
+		SHA256(d, k_len + 4, digest);
+		memcpy(out, digest, key_len <= sizeof(digest) ? key_len : sizeof(digest));
+	}
 	g_free(d);
 }
 
@@ -193,10 +239,27 @@ GByteArray *pace_derive_k_mrz(const char *document_number, const char *date_of_b
 }
 
 /* ---- AES-CBC (no padding - all PACE ciphertext here is already
- * block-aligned) and truncated AES-CMAC-128, the two primitives PACE's
- * secure messaging and Mutual Authenticate steps both need ---- */
+ * block-aligned) and truncated AES-CMAC, the two primitives PACE's secure
+ * messaging and Mutual Authenticate steps both need. Every one of these
+ * takes key_len (16 or 32) and picks AES-128 vs AES-256 - the block size
+ * (and so the IV/output size) is unaffected, only the key/cipher is. ---- */
 
-static gboolean aes_cbc(gboolean encrypt, const guint8 key[PACE_KEY_LEN],
+static const EVP_CIPHER *aes_cbc_cipher(gsize key_len)
+{
+	return key_len == 32 ? EVP_aes_256_cbc() : EVP_aes_128_cbc();
+}
+
+static const EVP_CIPHER *aes_ecb_cipher(gsize key_len)
+{
+	return key_len == 32 ? EVP_aes_256_ecb() : EVP_aes_128_ecb();
+}
+
+static const char *aes_cmac_cipher_name(gsize key_len)
+{
+	return key_len == 32 ? "AES-256-CBC" : "AES-128-CBC";
+}
+
+static gboolean aes_cbc(gboolean encrypt, const guint8 *key, gsize key_len,
                         const guint8 iv[AES_BLOCK_LEN], const guint8 *in, gsize len, guint8 *out)
 {
 	EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
@@ -206,7 +269,7 @@ static gboolean aes_cbc(gboolean encrypt, const guint8 key[PACE_KEY_LEN],
 	if (!ctx)
 		return FALSE;
 
-	ok = EVP_CipherInit_ex(ctx, EVP_aes_128_cbc(), NULL, key, iv, encrypt) &&
+	ok = EVP_CipherInit_ex(ctx, aes_cbc_cipher(key_len), NULL, key, iv, encrypt) &&
 	    EVP_CIPHER_CTX_set_padding(ctx, 0) &&
 	    EVP_CipherUpdate(ctx, out, &outlen1, in, (int) len) &&
 	    EVP_CipherFinal_ex(ctx, out + outlen1, &outlen2);
@@ -215,9 +278,9 @@ static gboolean aes_cbc(gboolean encrypt, const guint8 key[PACE_KEY_LEN],
 	return ok && (gsize)(outlen1 + outlen2) == len;
 }
 
-/* AES-128-ECB single block - used only to compute the SM encryption IV,
+/* AES-ECB single block - used only to compute the SM encryption IV,
  * E(KSenc, SSC) (9303-11 Annex F.4.2.1), not for bulk data. */
-static gboolean aes_ecb_encrypt_block(const guint8 key[PACE_KEY_LEN],
+static gboolean aes_ecb_encrypt_block(const guint8 *key, gsize key_len,
                                       const guint8 in[AES_BLOCK_LEN], guint8 out[AES_BLOCK_LEN])
 {
 	EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
@@ -227,7 +290,7 @@ static gboolean aes_ecb_encrypt_block(const guint8 key[PACE_KEY_LEN],
 	if (!ctx)
 		return FALSE;
 
-	ok = EVP_CipherInit_ex(ctx, EVP_aes_128_ecb(), NULL, key, NULL, 1) &&
+	ok = EVP_CipherInit_ex(ctx, aes_ecb_cipher(key_len), NULL, key, NULL, 1) &&
 	    EVP_CIPHER_CTX_set_padding(ctx, 0) &&
 	    EVP_CipherUpdate(ctx, out, &outlen1, in, AES_BLOCK_LEN) &&
 	    EVP_CipherFinal_ex(ctx, out + outlen1, &outlen2);
@@ -238,13 +301,15 @@ static gboolean aes_ecb_encrypt_block(const guint8 key[PACE_KEY_LEN],
 
 /* Full (16-byte) AES-CMAC - callers needing the 8-byte authentication
  * token truncate the result themselves (9303-11 Annex A.2.4/F.4.2.2 both
- * truncate, but to different things: a token vs a MAC datagram prefix). */
-static gboolean aes_cmac(const guint8 key[PACE_KEY_LEN], const guint8 *data, gsize len,
+ * truncate, but to different things: a token vs a MAC datagram prefix).
+ * The MAC's own output is always one block (128 bits) regardless of key
+ * length - only the key/cipher passed to EVP_Q_mac changes. */
+static gboolean aes_cmac(const guint8 *key, gsize key_len, const guint8 *data, gsize len,
                          guint8 out[AES_BLOCK_LEN])
 {
 	size_t outlen = 0;
 
-	return EVP_Q_mac(NULL, "CMAC", NULL, "AES-128-CBC", NULL, key, PACE_KEY_LEN,
+	return EVP_Q_mac(NULL, "CMAC", NULL, aes_cmac_cipher_name(key_len), NULL, key, key_len,
 	                 data, len, out, AES_BLOCK_LEN, &outlen) != NULL && outlen == AES_BLOCK_LEN;
 }
 
@@ -350,13 +415,17 @@ GByteArray *pace_build_get_nonce(void)
 	return apdu;
 }
 
-PaceExchange *pace_exchange_new(const GByteArray *k, int curve_nid)
+PaceExchange *pace_exchange_new(const GByteArray *k, int curve_nid, const guint8 *oid,
+                                gsize oid_len)
 {
 	PaceExchange *pace;
 	EC_GROUP *group;
 	BN_CTX *ctx;
+	gsize key_len = pace_key_len_for_oid(oid, oid_len);
+	gint degree;
+	gsize coord_len;
 
-	if (curve_nid == 0)
+	if (curve_nid == 0 || key_len == 0 || oid_len > sizeof(pace->oid))
 		return NULL;
 
 	group = EC_GROUP_new_by_curve_name(curve_nid);
@@ -370,10 +439,23 @@ PaceExchange *pace_exchange_new(const GByteArray *k, int curve_nid)
 		return NULL;
 	}
 
+	degree = EC_GROUP_get_degree(group);
+	coord_len = degree > 0 ? (gsize)(degree + 7) / 8 : 0;
+	if (coord_len == 0 || coord_len > PACE_COORD_LEN_MAX) {
+		EC_GROUP_free(group);
+		BN_CTX_free(ctx);
+		return NULL;
+	}
+
 	pace = g_new0(PaceExchange, 1);
 	pace->group = group;
 	pace->ctx = ctx;
-	pace_kdf(k->data, k->len, 3, pace->kpi);
+	pace->key_len = key_len;
+	pace->coord_len = coord_len;
+	pace->pub_len = 1 + 2 * coord_len;
+	memcpy(pace->oid, oid, oid_len);
+	pace->oid_len = oid_len;
+	pace_kdf(k->data, k->len, 3, key_len, pace->kpi);
 	return pace;
 }
 
@@ -400,27 +482,33 @@ gboolean pace_process_nonce_response(PaceExchange *pace, const guint8 *resp, gsi
 	const guint8 *z;
 	gsize z_len;
 
-	if (!find_in_7c(resp, len, 0x80, &z, &z_len) || z_len != AES_BLOCK_LEN)
+	if (!find_in_7c(resp, len, 0x80, &z, &z_len))
+		return FALSE;
+	if (z_len == 0 || z_len % AES_BLOCK_LEN != 0 || z_len > PACE_NONCE_LEN_MAX)
 		return FALSE;
 
-	return aes_cbc(FALSE, pace->kpi, (guint8[AES_BLOCK_LEN]) { 0 }, z, AES_BLOCK_LEN,
-	              pace->nonce_s);
+	if (!aes_cbc(FALSE, pace->kpi, pace->key_len, (guint8[AES_BLOCK_LEN]) { 0 }, z, z_len,
+	            pace->nonce_s))
+		return FALSE;
+	pace->nonce_len = z_len;
+	return TRUE;
 }
 
-/* Serializes an EC_POINT as an uncompressed octet string, 0x04 || x || y. */
+/* Serializes an EC_POINT as an uncompressed octet string, 0x04 || x || y.
+ * pub_len is the curve's own (1 + 2*coord_len) - callers pass pace->pub_len. */
 static gboolean point_to_bytes(const EC_GROUP *group, const EC_POINT *point, BN_CTX *ctx,
-                               guint8 out[EC_PUB_LEN])
+                               guint8 *out, gsize pub_len)
 {
-	return EC_POINT_point2oct(group, point, POINT_CONVERSION_UNCOMPRESSED, out, EC_PUB_LEN,
-	                          ctx) == EC_PUB_LEN;
+	return EC_POINT_point2oct(group, point, POINT_CONVERSION_UNCOMPRESSED, out, pub_len,
+	                          ctx) == pub_len;
 }
 
 static EC_POINT *point_from_bytes(const EC_GROUP *group, const guint8 *data, gsize len,
-                                  BN_CTX *ctx)
+                                  BN_CTX *ctx, gsize expect_pub_len)
 {
 	EC_POINT *point;
 
-	if (len != EC_PUB_LEN || data[0] != 0x04)
+	if (len != expect_pub_len || data[0] != 0x04)
 		return NULL;
 
 	point = EC_POINT_new(group);
@@ -451,7 +539,7 @@ static BIGNUM *random_scalar(const BIGNUM *order)
 GByteArray *pace_build_map_nonce(PaceExchange *pace)
 {
 	EC_POINT *pub1;
-	guint8 pub1_bytes[EC_PUB_LEN];
+	guint8 pub1_bytes[PACE_PUB_LEN_MAX];
 	GByteArray *apdu;
 
 	pace->priv1 = random_scalar(EC_GROUP_get0_order(pace->group));
@@ -462,13 +550,13 @@ GByteArray *pace_build_map_nonce(PaceExchange *pace)
 	if (!pub1)
 		return NULL;
 	if (!EC_POINT_mul(pace->group, pub1, pace->priv1, NULL, NULL, pace->ctx) ||
-	   !point_to_bytes(pace->group, pub1, pace->ctx, pub1_bytes)) {
+	   !point_to_bytes(pace->group, pub1, pace->ctx, pub1_bytes, pace->pub_len)) {
 		EC_POINT_free(pub1);
 		return NULL;
 	}
 	EC_POINT_free(pub1);
 
-	apdu = build_ga(0x81, pub1_bytes, sizeof(pub1_bytes));
+	apdu = build_ga(0x81, pub1_bytes, pace->pub_len);
 	return apdu;
 }
 
@@ -484,11 +572,12 @@ gboolean pace_process_map_nonce_response(PaceExchange *pace, const guint8 *resp,
 	if (!find_in_7c(resp, len, 0x82, &chip_pub1_bytes, &chip_pub1_len))
 		return FALSE;
 
-	chip_pub1 = point_from_bytes(pace->group, chip_pub1_bytes, chip_pub1_len, pace->ctx);
+	chip_pub1 = point_from_bytes(pace->group, chip_pub1_bytes, chip_pub1_len, pace->ctx,
+	                             pace->pub_len);
 	h = EC_POINT_new(pace->group);
 	sg = EC_POINT_new(pace->group);
 	gtilde = EC_POINT_new(pace->group);
-	s = BN_bin2bn(pace->nonce_s, sizeof(pace->nonce_s), NULL);
+	s = BN_bin2bn(pace->nonce_s, pace->nonce_len, NULL);
 	p = BN_new();
 	a = BN_new();
 	b = BN_new();
@@ -555,12 +644,12 @@ GByteArray *pace_build_key_agreement(PaceExchange *pace)
 	/* multiplies by group2's generator, i.e. G~, since we passed NULL
 	 * for the explicit-point argument */
 	ok = EC_POINT_mul(pace->group2, pub2, pace->priv2, NULL, NULL, pace->ctx) &&
-	    point_to_bytes(pace->group2, pub2, pace->ctx, pace->my_pub2);
+	    point_to_bytes(pace->group2, pub2, pace->ctx, pace->my_pub2, pace->pub_len);
 	EC_POINT_free(pub2);
 	if (!ok)
 		return NULL;
 
-	return build_ga(0x83, pace->my_pub2, sizeof(pace->my_pub2));
+	return build_ga(0x83, pace->my_pub2, pace->pub_len);
 }
 
 gboolean pace_process_key_agreement_response(PaceExchange *pace, const guint8 *resp, gsize len,
@@ -570,16 +659,17 @@ gboolean pace_process_key_agreement_response(PaceExchange *pace, const guint8 *r
 	gsize chip_pub2_len;
 	EC_POINT *chip_pub2 = NULL, *shared = NULL;
 	BIGNUM *x = NULL, *y = NULL;
-	guint8 k[EC_COORD_LEN];
+	guint8 k[PACE_COORD_LEN_MAX];
 	gboolean ok = FALSE;
 
 	if (!find_in_7c(resp, len, 0x84, &chip_pub2_bytes, &chip_pub2_len))
 		return FALSE;
-	if (chip_pub2_len != sizeof(pace->chip_pub2))
+	if (chip_pub2_len != pace->pub_len)
 		return FALSE;
 	memcpy(pace->chip_pub2, chip_pub2_bytes, chip_pub2_len);
 
-	chip_pub2 = point_from_bytes(pace->group2, chip_pub2_bytes, chip_pub2_len, pace->ctx);
+	chip_pub2 = point_from_bytes(pace->group2, chip_pub2_bytes, chip_pub2_len, pace->ctx,
+	                             pace->pub_len);
 	shared = EC_POINT_new(pace->group2);
 	x = BN_new();
 	y = BN_new();
@@ -591,11 +681,12 @@ gboolean pace_process_key_agreement_response(PaceExchange *pace, const guint8 *r
 	/* Only the x-coordinate feeds the KDF (TR-03110 A.2.3 note on ECKA) */
 	if (!EC_POINT_get_affine_coordinates(pace->group2, shared, x, y, pace->ctx))
 		goto out;
-	if (BN_bn2binpad(x, k, sizeof(k)) != (int) sizeof(k))
+	if (BN_bn2binpad(x, k, pace->coord_len) != (int) pace->coord_len)
 		goto out;
 
-	pace_kdf(k, sizeof(k), 1, pace->session.ks_enc);
-	pace_kdf(k, sizeof(k), 2, pace->session.ks_mac);
+	pace_kdf(k, pace->coord_len, 1, pace->key_len, pace->session.ks_enc);
+	pace_kdf(k, pace->coord_len, 2, pace->key_len, pace->session.ks_mac);
+	pace->session.key_len = pace->key_len;
 	memset(pace->session.ssc, 0, PACE_SSC_LEN); /* TR-03110 F.5: new session starts at 0 */
 	*session_out = pace->session;
 
@@ -614,20 +705,23 @@ out:
 }
 
 /* Input data object for a Mutual Authenticate token, 9303-11 Supplement
- * G.1.2.4: 7F49 4F { 06 0A <oid> 86 41 <peer's round-3 ephemeral pubkey> } */
-static GByteArray *encode_token_input(const guint8 pub2[EC_PUB_LEN])
+ * G.1.2.4: 7F49 4F { 06 0A <oid> 86 41 <peer's round-3 ephemeral pubkey> }
+ * - the OID embedded here MUST be the one actually negotiated (pace->oid),
+ * not a fixed constant: with two supported OIDs now, whichever one wasn't
+ * chosen would make the token computable but wrong. */
+static GByteArray *encode_token_input(const PaceExchange *pace, const guint8 *pub2)
 {
 	GByteArray *inner = g_byte_array_new();
 	GByteArray *out = g_byte_array_new();
-	guint8 oid_tlv[2] = { 0x06, (guint8) sizeof(pace_oid) };
-	guint8 pub_tlv[2] = { 0x86, (guint8) EC_PUB_LEN };
-	guint8 outer_hdr[3] = { 0x7F, 0x49, (guint8)(sizeof(oid_tlv) + sizeof(pace_oid) +
-	                                            sizeof(pub_tlv) + EC_PUB_LEN) };
+	guint8 oid_tlv[2] = { 0x06, (guint8) pace->oid_len };
+	guint8 pub_tlv[2] = { 0x86, (guint8) pace->pub_len };
+	guint8 outer_hdr[3] = { 0x7F, 0x49, (guint8)(sizeof(oid_tlv) + pace->oid_len +
+	                                            sizeof(pub_tlv) + pace->pub_len) };
 
 	g_byte_array_append(inner, oid_tlv, sizeof(oid_tlv));
-	g_byte_array_append(inner, pace_oid, sizeof(pace_oid));
+	g_byte_array_append(inner, pace->oid, pace->oid_len);
 	g_byte_array_append(inner, pub_tlv, sizeof(pub_tlv));
-	g_byte_array_append(inner, pub2, EC_PUB_LEN);
+	g_byte_array_append(inner, pub2, pace->pub_len);
 
 	g_byte_array_append(out, outer_hdr, sizeof(outer_hdr));
 	g_byte_array_append(out, inner->data, inner->len);
@@ -635,12 +729,11 @@ static GByteArray *encode_token_input(const guint8 pub2[EC_PUB_LEN])
 	return out;
 }
 
-static gboolean compute_token(const guint8 ks_mac[PACE_KEY_LEN], const guint8 pub2[EC_PUB_LEN],
-                              guint8 token_out[8])
+static gboolean compute_token(const PaceExchange *pace, const guint8 *pub2, guint8 token_out[8])
 {
-	GByteArray *input = encode_token_input(pub2);
+	GByteArray *input = encode_token_input(pace, pub2);
 	guint8 mac[AES_BLOCK_LEN];
-	gboolean ok = aes_cmac(ks_mac, input->data, input->len, mac);
+	gboolean ok = aes_cmac(pace->session.ks_mac, pace->key_len, input->data, input->len, mac);
 
 	g_byte_array_free(input, TRUE);
 	if (ok)
@@ -648,7 +741,7 @@ static gboolean compute_token(const guint8 ks_mac[PACE_KEY_LEN], const guint8 pu
 	return ok;
 }
 
-GByteArray *pace_build_mutual_auth(PaceExchange *pace)
+GByteArray *pace_build_mutual_auth(const PaceExchange *pace)
 {
 	GByteArray *dad, *apdu;
 	guint8 token[8];
@@ -656,7 +749,7 @@ GByteArray *pace_build_mutual_auth(PaceExchange *pace)
 	guint8 lc, le = 0x00;
 
 	/* T_PCD authenticates to the chip using the chip's own round-3 key */
-	if (!compute_token(pace->session.ks_mac, pace->chip_pub2, token))
+	if (!compute_token(pace, pace->chip_pub2, token))
 		return NULL;
 
 	dad = wrap_7c(0x85, token, sizeof(token));
@@ -671,7 +764,7 @@ GByteArray *pace_build_mutual_auth(PaceExchange *pace)
 	return apdu;
 }
 
-gboolean pace_verify_mutual_auth_response(PaceExchange *pace, const guint8 *resp, gsize len)
+gboolean pace_verify_mutual_auth_response(const PaceExchange *pace, const guint8 *resp, gsize len)
 {
 	const guint8 *chip_token;
 	gsize chip_token_len;
@@ -681,7 +774,7 @@ gboolean pace_verify_mutual_auth_response(PaceExchange *pace, const guint8 *resp
 		return FALSE;
 
 	/* T_PICC authenticates the chip to us using our own round-3 key */
-	if (!compute_token(pace->session.ks_mac, pace->my_pub2, expect))
+	if (!compute_token(pace, pace->my_pub2, expect))
 		return FALSE;
 
 	return bytes_equal(expect, chip_token, 8);
@@ -746,8 +839,8 @@ GByteArray *pace_sm_protect(PaceSession *session, guint8 cla, guint8 ins, guint8
 		GByteArray *enc_field;
 		gboolean ok;
 
-		ok = aes_ecb_encrypt_block(session->ks_enc, session->ssc, iv) &&
-		    aes_cbc(TRUE, session->ks_enc, iv, padded->data, padded->len, enc);
+		ok = aes_ecb_encrypt_block(session->ks_enc, session->key_len, session->ssc, iv) &&
+		    aes_cbc(TRUE, session->ks_enc, session->key_len, iv, padded->data, padded->len, enc);
 		if (!ok) {
 			g_free(enc);
 			g_byte_array_free(padded, TRUE);
@@ -787,9 +880,20 @@ GByteArray *pace_sm_protect(PaceSession *session, guint8 cla, guint8 ins, guint8
 	g_byte_array_free(m, TRUE);
 
 	{
+		/* 9303-11 9.8.1: "Padding is always performed by the secure
+		 * messaging layer, therefore the underlying [CMAC] need not
+		 * perform any internal padding" - i.e. pad N ourselves so it's
+		 * already block-aligned, so CMAC's own length-based K1/K2
+		 * subkey choice lands on K1 (the "already aligned" branch) the
+		 * same way the spec's padded construction intends, instead of
+		 * silently taking the K2/auto-pad branch on our unpadded N -
+		 * same bytes appended, different (wrong) subkey, wrong MAC. */
+		GByteArray *n_padded = iso_pad(n->data, n->len);
 		guint8 full_mac[AES_BLOCK_LEN];
-		gboolean ok = aes_cmac(session->ks_mac, n->data, n->len, full_mac);
+		gboolean ok = aes_cmac(session->ks_mac, session->key_len, n_padded->data,
+		                       n_padded->len, full_mac);
 
+		g_byte_array_free(n_padded, TRUE);
 		g_byte_array_free(n, TRUE);
 		if (!ok) {
 			if (do87)
@@ -863,8 +967,12 @@ gboolean pace_sm_unprotect(PaceSession *session, const guint8 *rapdu, gsize rapd
 	g_byte_array_append(mac_input, do99, do99_len);
 
 	{
-		gboolean mac_ok = aes_cmac(session->ks_mac, mac_input->data, mac_input->len, mac);
+		/* Same pre-padding as pace_sm_protect() - see the comment there. */
+		GByteArray *mac_input_padded = iso_pad(mac_input->data, mac_input->len);
+		gboolean mac_ok = aes_cmac(session->ks_mac, session->key_len, mac_input_padded->data,
+		                          mac_input_padded->len, mac);
 
+		g_byte_array_free(mac_input_padded, TRUE);
 		g_byte_array_free(mac_input, TRUE);
 		if (!mac_ok)
 			return FALSE;
@@ -890,11 +998,11 @@ gboolean pace_sm_unprotect(PaceSession *session, const guint8 *rapdu, gsize rapd
 		if (enc_len == 0 || enc_len % AES_BLOCK_LEN != 0)
 			return FALSE;
 
-		if (!aes_ecb_encrypt_block(session->ks_enc, session->ssc, iv))
+		if (!aes_ecb_encrypt_block(session->ks_enc, session->key_len, session->ssc, iv))
 			return FALSE;
 
 		dec = g_malloc(enc_len);
-		if (!aes_cbc(FALSE, session->ks_enc, iv, enc, enc_len, dec)) {
+		if (!aes_cbc(FALSE, session->ks_enc, session->key_len, iv, enc, enc_len, dec)) {
 			g_free(dec);
 			return FALSE;
 		}
