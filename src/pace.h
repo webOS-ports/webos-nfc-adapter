@@ -28,30 +28,35 @@
  * generic mapping to a per-session curve generator, then a second ECDH on
  * that mapped curve) so the session keys are never derivable from the
  * password alone - the reason chips that support it use it instead of
- * BAC. Implements ECDH generic mapping with AES-128 session keys
- * (id-PACE-ECDH-GM-AES-CBC-CMAC-128), verified against the worked example
- * in ICAO 9303 Supplement, Appendix G (which uses brainpoolP256r1).
+ * BAC. Implements ECDH generic mapping with AES-128 or AES-256 session
+ * keys (id-PACE-ECDH-GM-AES-CBC-CMAC-128/256). The AES-128 path is
+ * verified against the worked example in ICAO 9303 Supplement, Appendix G
+ * (brainpoolP256r1); no official worked example exists yet for AES-256 -
+ * see pace_kdf()/aes_cbc()/aes_cmac() for how that path is verified
+ * instead (NIST primitive vectors, real hardware).
  *
  * The chip's own EF.CardAccess (read unauthenticated, before MSE:Set AT -
  * see pace_parse_card_access()) says which PACE variant and domain
  * parameters it actually wants; real documents vary (NIST P-256 is just
- * as common as brainpoolP256r1). This build follows suit on the curve
- * (pace_ec_curve_for_parameter_id()) but keeps the OID fixed to GM-AES-128
- * (pace_oid_supported()) - the fixed-size point buffers throughout this
- * file assume a 32-byte field element, so only the two standardized
- * 256-bit curves (parameter IDs 12 and 13) are supported. A document
- * advertising AES-192/256, Integrated/Chip-Authentication Mapping, a DH
- * (non-EC) group, or a larger EC curve gets a clean, honest rejection
- * naming exactly what it asked for, not a silent wrong-parameter attempt.
+ * as common as brainpoolP256r1, and BSI TR-03110-3 Table 4's 320-bit
+ * BrainpoolP320r1, parameter ID 14, shows up in the wild too - it's what
+ * this build was extended for). pace_ec_curve_for_parameter_id() derives
+ * the field width from the curve itself (EC_GROUP_get_degree()) rather
+ * than hardcoding it per ID, so any EC curve OpenSSL knows about "just
+ * works" as long as its field fits PACE_COORD_LEN_MAX. AES-192
+ * (id-PACE-*-192, TR-03110-3 Table 7 arc suffix 3) and Integrated/Chip-
+ * Authentication Mapping remain unsupported - a document advertising them
+ * gets a clean, honest rejection naming exactly what it asked for.
  */
 
-#define PACE_KEY_LEN	16	/* AES-128 */
-#define PACE_SSC_LEN	16	/* AES block size */
+#define PACE_KEY_LEN_MAX	32	/* AES-256 */
+#define PACE_SSC_LEN		16	/* AES block size - fixed regardless of key length */
 
 typedef struct {
-	guint8 ks_enc[PACE_KEY_LEN];
-	guint8 ks_mac[PACE_KEY_LEN];
+	guint8 ks_enc[PACE_KEY_LEN_MAX];
+	guint8 ks_mac[PACE_KEY_LEN_MAX];
 	guint8 ssc[PACE_SSC_LEN];
+	gsize key_len;		/* 16 (AES-128) or 32 (AES-256) - which of the above is live */
 } PaceSession;
 
 typedef struct PaceExchange PaceExchange;
@@ -84,25 +89,28 @@ typedef struct {
 gsize pace_parse_card_access(const guint8 *data, gsize len, PaceInfoEntry *entries,
                              gsize max_entries);
 
-/* True if oid is the one PACE variant this build actually implements
- * (id-PACE-ECDH-GM-AES-CBC-CMAC-128). */
+/* True if oid is a PACE variant this build actually implements
+ * (id-PACE-ECDH-GM-AES-CBC-CMAC-128 or -256). */
 gboolean pace_oid_supported(const guint8 *oid, gsize oid_len);
 
-/* Maps a standardized EC parameterId (TR-03110 Table 6, IDs 8-18) to an
- * OpenSSL curve NID - but only the two with a 32-byte field element
- * (12 = NIST P-256, 13 = brainpoolP256r1), since that's what this file's
- * point buffers are sized for (see the scope note above). 0 for anything
+/* Maps a standardized EC parameterId (TR-03110 Table 4, IDs 8-18) to an
+ * OpenSSL curve NID - only the ones whose field element fits
+ * PACE_COORD_LEN_MAX (currently every one of them does: the largest
+ * listed, secp521r1, doesn't - see pace_exchange_new()). 0 for anything
  * else, including the DH (non-EC) IDs 0-2. */
 int pace_ec_curve_for_parameter_id(gint parameter_id);
 
 /*
  * Starts a PACE exchange: derives Kpi = KDF(K,3) (TR-03110 A.2.3.2) from
  * the password encoding k, on the given OpenSSL curve NID (from
- * pace_ec_curve_for_parameter_id()). Caller keeps ownership of k and can
- * free it right after this call. Returns NULL on an OpenSSL EC setup
- * failure or an unsupported curve_nid.
+ * pace_ec_curve_for_parameter_id()), using the AES key length that oid
+ * (one of pace_oid_supported()'s variants) selects. oid is copied - the
+ * caller doesn't need to keep it (or k) alive past this call. Returns NULL
+ * on an OpenSSL EC setup failure, an unsupported curve_nid/oid, or a curve
+ * whose field is wider than PACE_COORD_LEN_MAX.
  */
-PaceExchange *pace_exchange_new(const GByteArray *k, int curve_nid);
+PaceExchange *pace_exchange_new(const GByteArray *k, int curve_nid, const guint8 *oid,
+                                gsize oid_len);
 void pace_exchange_free(PaceExchange *pace);
 
 /* MSE:Set AT: 00 22 C1 A4, selecting the given PACEInfo protocol OID
@@ -130,18 +138,23 @@ gboolean pace_process_key_agreement_response(PaceExchange *pace, const guint8 *r
 /* Round 4, Mutual Authenticate: each side proves it derived the same
  * KS_mac by sending an AES-CMAC (truncated to 8 bytes) over the other
  * side's round-3 ephemeral public key. */
-GByteArray *pace_build_mutual_auth(PaceExchange *pace);
-gboolean pace_verify_mutual_auth_response(PaceExchange *pace, const guint8 *resp, gsize len);
+GByteArray *pace_build_mutual_auth(const PaceExchange *pace);
+gboolean pace_verify_mutual_auth_response(const PaceExchange *pace, const guint8 *resp, gsize len);
 
 /*
  * Secure messaging after PACE: same DO'87'/'97'/'99'/'8E' TLV wrapping as
  * bac_sm_protect()/bac_sm_unprotect() (9303-11 Annex F), but AES-CBC/
- * AES-CMAC-128 instead of 3DES/retail-MAC, a 16-byte (not 8-byte) IV/SSC,
- * and an encryption IV of E(KSenc, SSC) rather than an all-zero IV -
- * different enough from BAC's session crypto that sharing bac.c's
- * functions isn't an option. SSC starts at all-zero (TR-03110 F.5) and is
- * expected to already be so in *session on the first call after
- * pace_process_key_agreement_response().
+ * AES-CMAC (128 or 256-bit, per session->key_len) instead of 3DES/
+ * retail-MAC, a 16-byte (not 8-byte) IV/SSC, and an encryption IV of
+ * E(KSenc, SSC) rather than an all-zero IV - different enough from BAC's
+ * session crypto that sharing bac.c's functions isn't an option. SSC
+ * starts at all-zero (TR-03110 F.5) and is expected to already be so in
+ * *session on the first call after pace_process_key_agreement_response()
+ * (which also sets key_len - callers don't set it themselves). The MAC
+ * input is ISO-padded before hashing (9303-11 9.8.1: "padding is always
+ * performed by the secure messaging layer" - real hardware confirmed this
+ * the hard way: without it, AES-CMAC's own internal padding picks the
+ * wrong subkey and every protected exchange gets rejected by the chip).
  */
 GByteArray *pace_sm_protect(PaceSession *session, guint8 cla, guint8 ins, guint8 p1, guint8 p2,
                             const guint8 *data, gsize data_len, gint le);

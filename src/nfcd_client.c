@@ -1404,7 +1404,8 @@ static gchar *passport_pick_pace_entry(struct passport_read *read)
 		if (curve_nid == 0)
 			continue;
 
-		read->pace = pace_exchange_new(read->pace_k, curve_nid);
+		read->pace = pace_exchange_new(read->pace_k, curve_nid, entries[i].oid,
+		                               entries[i].oid_len);
 		g_byte_array_free(read->pace_k, TRUE);
 		read->pace_k = NULL;
 		if (!read->pace)
@@ -1425,8 +1426,8 @@ static gchar *passport_pick_pace_entry(struct passport_read *read)
 	{
 		GString *msg = g_string_new(
 			"This document's PACEInfo doesn't match anything this build "
-			"supports (only ECDH-GM-AES-128 on NIST P-256 or "
-			"brainpoolP256r1 - see pace.h). Found: ");
+			"supports (only ECDH-GM-AES-128/256 on NIST P-256, "
+			"brainpoolP256r1 or brainpoolP320r1 - see pace.h). Found: ");
 
 		for (i = 0; i < count; i++) {
 			gsize j;
