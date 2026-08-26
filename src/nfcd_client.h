@@ -95,6 +95,22 @@ void nfcd_client_write_raw(struct nfcd_client *client, const GByteArray *raw_dat
  */
 void nfcd_client_lock_tag(struct nfcd_client *client, nfcd_result_cb cb, void *user_data);
 
+/**
+ * Registers a simple card-emulation profile: while active, this device
+ * answers a reader that selects the given AID with the given static
+ * payload (SW 90 00) for any APDU. Not a general APDU responder or relay -
+ * one fixed response per profile, deliberately, so this can only be used
+ * for something like a personal access-badge identifier, never to proxy
+ * or clone a live card session. Takes ownership of nothing.
+ */
+void nfcd_client_set_card_emulation(struct nfcd_client *client,
+                                    const GByteArray *aid, const GByteArray *payload,
+                                    nfcd_result_cb cb, void *user_data);
+
+/* Unregisters the profile set by nfcd_client_set_card_emulation(), if any */
+void nfcd_client_clear_card_emulation(struct nfcd_client *client,
+                                      nfcd_result_cb cb, void *user_data);
+
 #endif
 
 // vim:ts=4:sw=4:noexpandtab

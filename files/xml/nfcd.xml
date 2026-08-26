@@ -5,6 +5,7 @@
 
   Taken from nfcd 1.2.7 (https://github.com/sailfishos/nfcd):
     plugins/dbus_service/org.sailfishos.nfc.{Daemon,Adapter,Tag,TagType2,NDEF}.xml
+    plugins/dbus_service/org.sailfishos.nfc.LocalHostApp.xml
     plugins/settings/org.sailfishos.nfc.Settings.xml
 
   Two bus names are involved, both on the system bus:
@@ -13,6 +14,12 @@
                                  /nfc0/tag0        Tag, TagType2
                                  /nfc0/tag0/rec0   NDEF
     org.sailfishos.nfc.settings  /        Settings
+
+  LocalHostApp is the other direction: we export an object implementing
+  it, nfcd calls into it once we've registered an AID via
+  Daemon.RegisterLocalHostApp. Same AID-select/APDU-exchange model as
+  Android's HCE (HostApduService/CardEmulation, see
+  developer.android.com/develop/connectivity/nfc/hce).
 -->
 <node>
 <interface name="org.sailfishos.nfc.Daemon">
@@ -550,6 +557,51 @@
       <arg name="data" type="ay" direction="out">
         <annotation name="org.gtk.GDBus.C.ForceGVariant" value="true"/>
       </arg>
+    </method>
+  </interface>
+  <interface name="org.sailfishos.nfc.LocalHostApp">
+    <!-- We implement this one - nfcd calls in once the AID is selected -->
+    <method name="GetInterfaceVersion">
+      <arg name="version" type="i" direction="out"/>
+    </method>
+    <method name="Start">
+      <arg name="host" type="o" direction="in"/>
+    </method>
+    <method name="Restart">
+      <arg name="host" type="o" direction="in"/>
+    </method>
+    <method name="Stop">
+      <arg name="path" type="o" direction="in"/>
+    </method>
+    <method name="ImplicitSelect">
+      <arg name="host" type="o" direction="in"/>
+    </method>
+    <method name="Select">
+      <arg name="host" type="o" direction="in"/>
+    </method>
+    <method name="Deselect">
+      <arg name="path" type="o" direction="in"/>
+    </method>
+    <method name="Process">
+      <arg name="host" type="o" direction="in"/>
+      <arg name="CLA" type="y" direction="in"/>
+      <arg name="INS" type="y" direction="in"/>
+      <arg name="P1" type="y" direction="in"/>
+      <arg name="P2" type="y" direction="in"/>
+      <arg name="data" type="ay" direction="in">
+        <annotation name="org.gtk.GDBus.C.ForceGVariant" value="true"/>
+      </arg>
+      <arg name="Le" type="u" direction="in"/>
+      <arg name="response" type="ay" direction="out">
+        <annotation name="org.gtk.GDBus.C.ForceGVariant" value="true"/>
+      </arg>
+      <arg name="SW1" type="y" direction="out"/>
+      <arg name="SW2" type="y" direction="out"/>
+      <arg name="response_id" type="u" direction="out"/>
+    </method>
+    <method name="ResponseStatus">
+      <arg name="response_id" type="u" direction="in"/>
+      <arg name="ok" type="b" direction="in"/>
     </method>
   </interface>
 </node>

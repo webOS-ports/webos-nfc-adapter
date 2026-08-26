@@ -401,6 +401,93 @@ static bool _service_clone_tag_cb(LSHandle *handle, LSMessage *message, void *us
 	return true;
 }
 
+static void set_card_emulation_result_cb(gboolean success, const char *error_text,
+                                         void *user_data)
+{
+	struct nfc_request *req = user_data;
+
+	if (success)
+		luna_service_message_reply_success(req->handle, req->message);
+	else
+		luna_service_message_reply_custom_error(req->handle, req->message,
+		                                        error_text ? error_text : "Failed to set card emulation profile");
+
+	nfc_request_free(req);
+}
+
+static bool _service_set_card_emulation_cb(LSHandle *handle, LSMessage *message, void *user_data)
+{
+	struct nfc_service *service = user_data;
+	jvalue_ref parsed_obj = NULL;
+	gchar *aid_hex = NULL;
+	gchar *payload_hex = NULL;
+	GByteArray *aid, *payload;
+
+	parsed_obj = luna_service_message_parse_and_validate(LSMessageGetPayload(message));
+	if (!parsed_obj) {
+		luna_service_message_reply_error_bad_json(handle, message);
+		return true;
+	}
+
+	/*
+	 * aidHex: the ISO 7816-5 Application ID a reader selects to reach
+	 * this profile. payloadHex: the fixed bytes returned for any APDU
+	 * once selected - a personal identifier, not card data. Both are
+	 * plain hex strings, same encoding as getTagInfo's rawDataHex.
+	 */
+	aid_hex = get_string_param(parsed_obj, "aidHex");
+	payload_hex = get_string_param(parsed_obj, "payloadHex");
+
+	j_release(&parsed_obj);
+
+	aid = ndef_hex_to_bytes(aid_hex);
+	g_free(aid_hex);
+
+	if (!aid) {
+		luna_service_message_reply_custom_error(handle, message,
+			"Expected aidHex, the Application ID to register");
+		g_free(payload_hex);
+		return true;
+	}
+
+	payload = ndef_hex_to_bytes(payload_hex);
+	g_free(payload_hex);
+
+	nfcd_client_set_card_emulation(service->client, aid, payload,
+	                               set_card_emulation_result_cb,
+	                               nfc_request_new(handle, message));
+
+	g_byte_array_free(aid, TRUE);
+	if (payload)
+		g_byte_array_free(payload, TRUE);
+
+	return true;
+}
+
+static void clear_card_emulation_result_cb(gboolean success, const char *error_text,
+                                           void *user_data)
+{
+	struct nfc_request *req = user_data;
+
+	if (success)
+		luna_service_message_reply_success(req->handle, req->message);
+	else
+		luna_service_message_reply_custom_error(req->handle, req->message,
+		                                        error_text ? error_text : "Failed to clear card emulation profile");
+
+	nfc_request_free(req);
+}
+
+static bool _service_clear_card_emulation_cb(LSHandle *handle, LSMessage *message, void *user_data)
+{
+	struct nfc_service *service = user_data;
+
+	nfcd_client_clear_card_emulation(service->client, clear_card_emulation_result_cb,
+	                                 nfc_request_new(handle, message));
+
+	return true;
+}
+
 static LSMethod _nfc_service_methods[] = {
 	{ "getStatus", _service_get_status_cb },
 	{ "setEnabled", _service_set_enabled_cb },
@@ -408,6 +495,8 @@ static LSMethod _nfc_service_methods[] = {
 	{ "writeTag", _service_write_tag_cb },
 	{ "lockTag", _service_lock_tag_cb },
 	{ "cloneTag", _service_clone_tag_cb },
+	{ "setCardEmulation", _service_set_card_emulation_cb },
+	{ "clearCardEmulation", _service_clear_card_emulation_cb },
 	{ NULL, NULL },
 };
 
