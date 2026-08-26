@@ -31,8 +31,105 @@
 #define EC_COORD_LEN	32	/* brainpoolP256r1 field element size */
 #define EC_PUB_LEN	(1 + 2 * EC_COORD_LEN)	/* uncompressed point, 0x04 || x || y */
 
-/* id-PACE-ECDH-GM-AES-CBC-CMAC-128, ICAO 9303 Supplement Appendix G.1.1 */
+/* id-PACE-ECDH-GM-AES-CBC-CMAC-128, ICAO 9303 Supplement Appendix G.1.1 /
+ * BSI TR-03110 - the one PACEInfo variant this file implements. */
 static const guint8 pace_oid[] = { 0x04, 0x00, 0x7F, 0x00, 0x07, 0x02, 0x02, 0x04, 0x02, 0x02 };
+
+/* id-PACE = 0.4.0.127.0.7.2.2.4 - every PACEInfo OID (any mapping, any
+ * cipher) starts with this; used to pick SecurityInfo entries worth
+ * looking at out of EF.CardAccess (which also lists unrelated protocols
+ * like Chip/Terminal Authentication). */
+static const guint8 id_pace_prefix[] = { 0x04, 0x00, 0x7F, 0x00, 0x07, 0x02, 0x02, 0x04 };
+
+gboolean pace_oid_supported(const guint8 *oid, gsize oid_len)
+{
+	return oid_len == sizeof(pace_oid) && memcmp(oid, pace_oid, oid_len) == 0;
+}
+
+int pace_ec_curve_for_parameter_id(gint parameter_id)
+{
+	switch (parameter_id) {
+	case 12: return NID_X9_62_prime256v1;	/* NIST P-256 / secp256r1 */
+	case 13: return NID_brainpoolP256r1;
+	default: return 0;	/* everything else needs a field width this file isn't sized for */
+	}
+}
+
+/* ---- EF.CardAccess = DER SET OF SecurityInfo (SEQUENCE { OID, INTEGER
+ * version, INTEGER parameterId OPTIONAL }) - reuses bac_ber_tlv_header()
+ * for the TLV walk, same as this file's own APDU parsing. ---- */
+
+gsize pace_parse_card_access(const guint8 *data, gsize len, PaceInfoEntry *entries,
+                             gsize max_entries)
+{
+	gsize outer_header, outer_content, pos, end, count = 0;
+
+	if (len < 2 || data[0] != 0x31 ||
+	    !bac_ber_tlv_header(data, len, &outer_header, &outer_content) ||
+	    outer_header + outer_content > len)
+		return 0;
+
+	pos = outer_header;
+	end = outer_header + outer_content;
+
+	while (pos < end && count < max_entries) {
+		gsize seq_header, seq_content, seq_len, p;
+		const guint8 *seq = data + pos;
+
+		if (data[pos] != 0x30 ||
+		    !bac_ber_tlv_header(seq, end - pos, &seq_header, &seq_content))
+			break;
+
+		seq_len = seq_header + seq_content;
+		if (pos + seq_len > end)
+			break;
+
+		p = seq_header;
+		if (p < seq_len && seq[p] == 0x06) {
+			gsize oid_hdr, oid_content;
+
+			if (bac_ber_tlv_header(seq + p, seq_len - p, &oid_hdr, &oid_content) &&
+			    oid_content > 0 && oid_content <= sizeof(entries[0].oid) &&
+			    oid_content >= sizeof(id_pace_prefix) &&
+			    memcmp(seq + p + oid_hdr, id_pace_prefix, sizeof(id_pace_prefix)) == 0) {
+				PaceInfoEntry *e = &entries[count];
+
+				memcpy(e->oid, seq + p + oid_hdr, oid_content);
+				e->oid_len = oid_content;
+				e->parameter_id = -1;
+				p += oid_hdr + oid_content;
+
+				/* INTEGER version (must be 2, not checked - unsupported
+				 * versions still name a real OID/parameterId worth
+				 * reporting in a rejection message) */
+				if (p < seq_len && seq[p] == 0x02) {
+					gsize vh, vc;
+
+					if (bac_ber_tlv_header(seq + p, seq_len - p, &vh, &vc))
+						p += vh + vc;
+				}
+
+				/* optional trailing INTEGER parameterId */
+				if (p < seq_len && seq[p] == 0x02) {
+					gsize ih, ic;
+
+					if (bac_ber_tlv_header(seq + p, seq_len - p, &ih, &ic) &&
+					    ic >= 1 && ic <= 4) {
+						gint val = 0;
+						gsize i;
+
+						for (i = 0; i < ic; i++)
+							val = (val << 8) | seq[p + ih + i];
+						e->parameter_id = val;
+					}
+				}
+				count++;
+			}
+		}
+		pos += seq_len;
+	}
+	return count;
+}
 
 struct PaceExchange {
 	guint8 kpi[PACE_KEY_LEN];
@@ -208,18 +305,18 @@ static gboolean find_in_7c(const guint8 *resp, gsize len, guint8 tag,
 
 /* ---- MSE:Set AT / GA APDU builders ---- */
 
-GByteArray *pace_build_mse_set_at(gboolean use_can)
+GByteArray *pace_build_mse_set_at(const guint8 *oid, gsize oid_len, gboolean use_can)
 {
 	GByteArray *apdu = g_byte_array_new();
 	guint8 header[] = { 0x00, 0x22, 0xC1, 0xA4 };
-	guint8 oid_tlv[2] = { 0x80, (guint8) sizeof(pace_oid) };
+	guint8 oid_tlv[2] = { 0x80, (guint8) oid_len };
 	guint8 pwd_tlv[3] = { 0x83, 0x01, (guint8)(use_can ? 0x02 : 0x01) };
-	guint8 lc = (guint8)(sizeof(oid_tlv) + sizeof(pace_oid) + sizeof(pwd_tlv));
+	guint8 lc = (guint8)(sizeof(oid_tlv) + oid_len + sizeof(pwd_tlv));
 
 	g_byte_array_append(apdu, header, sizeof(header));
 	g_byte_array_append(apdu, &lc, 1);
 	g_byte_array_append(apdu, oid_tlv, sizeof(oid_tlv));
-	g_byte_array_append(apdu, pace_oid, sizeof(pace_oid));
+	g_byte_array_append(apdu, oid, oid_len);
 	g_byte_array_append(apdu, pwd_tlv, sizeof(pwd_tlv));
 	return apdu;
 }
@@ -253,11 +350,17 @@ GByteArray *pace_build_get_nonce(void)
 	return apdu;
 }
 
-PaceExchange *pace_exchange_new(const GByteArray *k)
+PaceExchange *pace_exchange_new(const GByteArray *k, int curve_nid)
 {
 	PaceExchange *pace;
-	EC_GROUP *group = EC_GROUP_new_by_curve_name(NID_brainpoolP256r1);
-	BN_CTX *ctx = BN_CTX_new();
+	EC_GROUP *group;
+	BN_CTX *ctx;
+
+	if (curve_nid == 0)
+		return NULL;
+
+	group = EC_GROUP_new_by_curve_name(curve_nid);
+	ctx = BN_CTX_new();
 
 	if (!group || !ctx) {
 		if (group)

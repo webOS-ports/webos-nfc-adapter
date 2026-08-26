@@ -29,17 +29,20 @@
  * that mapped curve) so the session keys are never derivable from the
  * password alone - the reason chips that support it use it instead of
  * BAC. Implements ECDH generic mapping with AES-128 session keys
- * (id-PACE-ECDH-GM-AES-CBC-CMAC-128) on the standardized brainpoolP256r1
- * domain parameters, since that's what this implementation is verified
- * against (see the worked example in ICAO 9303 Supplement, Appendix G).
+ * (id-PACE-ECDH-GM-AES-CBC-CMAC-128), verified against the worked example
+ * in ICAO 9303 Supplement, Appendix G (which uses brainpoolP256r1).
  *
- * Scope note: a chip's actual PACEInfo (in EF.CardAccess) can name a
- * different curve or a different PACE variant entirely - this
- * implementation does not read/parse EF.CardAccess and always asserts the
- * brainpoolP256r1/AES-128/CAM-GM combination in MSE:Set AT. If the chip
- * needs something else, MSE:Set AT or the round-1 GET NONCE step will
- * simply fail (see pace_build_mse_set_at()'s comment) - a clean, honest
- * failure, not a silent wrong-parameter attempt.
+ * The chip's own EF.CardAccess (read unauthenticated, before MSE:Set AT -
+ * see pace_parse_card_access()) says which PACE variant and domain
+ * parameters it actually wants; real documents vary (NIST P-256 is just
+ * as common as brainpoolP256r1). This build follows suit on the curve
+ * (pace_ec_curve_for_parameter_id()) but keeps the OID fixed to GM-AES-128
+ * (pace_oid_supported()) - the fixed-size point buffers throughout this
+ * file assume a 32-byte field element, so only the two standardized
+ * 256-bit curves (parameter IDs 12 and 13) are supported. A document
+ * advertising AES-192/256, Integrated/Chip-Authentication Mapping, a DH
+ * (non-EC) group, or a larger EC curve gets a clean, honest rejection
+ * naming exactly what it asked for, not a silent wrong-parameter attempt.
  */
 
 #define PACE_KEY_LEN	16	/* AES-128 */
@@ -63,17 +66,49 @@ GByteArray *pace_derive_k_can(const char *can);
 GByteArray *pace_derive_k_mrz(const char *document_number, const char *date_of_birth,
                               const char *date_of_expiry);
 
+/* One PACEInfo entry found in EF.CardAccess: its protocol OID and,
+ * for standardized EC domain parameters, the parameterId (TR-03110
+ * Table 6) - -1 if absent (explicit/proprietary domain parameters,
+ * which this implementation doesn't support). */
+typedef struct {
+	guint8 oid[16];
+	gsize oid_len;
+	gint parameter_id;
+} PaceInfoEntry;
+
+/* Parses EF.CardAccess = DER SET OF SecurityInfo (ICAO 9303-11 4.1 /
+ * TR-03110 3.2.1), returning every PACEInfo entry found (SecurityInfos
+ * whose OID falls under id-PACE), up to max_entries. A malformed file
+ * or one with no PACEInfo just yields 0 - EF.CardAccess isn't itself
+ * authenticated, so that's "nothing usable", not a hard parse error. */
+gsize pace_parse_card_access(const guint8 *data, gsize len, PaceInfoEntry *entries,
+                             gsize max_entries);
+
+/* True if oid is the one PACE variant this build actually implements
+ * (id-PACE-ECDH-GM-AES-CBC-CMAC-128). */
+gboolean pace_oid_supported(const guint8 *oid, gsize oid_len);
+
+/* Maps a standardized EC parameterId (TR-03110 Table 6, IDs 8-18) to an
+ * OpenSSL curve NID - but only the two with a 32-byte field element
+ * (12 = NIST P-256, 13 = brainpoolP256r1), since that's what this file's
+ * point buffers are sized for (see the scope note above). 0 for anything
+ * else, including the DH (non-EC) IDs 0-2. */
+int pace_ec_curve_for_parameter_id(gint parameter_id);
+
 /*
  * Starts a PACE exchange: derives Kpi = KDF(K,3) (TR-03110 A.2.3.2) from
- * the password encoding k. Caller keeps ownership of k and can free it
- * right after this call. Returns NULL on an OpenSSL EC setup failure.
+ * the password encoding k, on the given OpenSSL curve NID (from
+ * pace_ec_curve_for_parameter_id()). Caller keeps ownership of k and can
+ * free it right after this call. Returns NULL on an OpenSSL EC setup
+ * failure or an unsupported curve_nid.
  */
-PaceExchange *pace_exchange_new(const GByteArray *k);
+PaceExchange *pace_exchange_new(const GByteArray *k, int curve_nid);
 void pace_exchange_free(PaceExchange *pace);
 
-/* MSE:Set AT: 00 22 C1 A4, selecting id-PACE-ECDH-GM-AES-CBC-CMAC-128 and
- * either CAN (use_can) or MRZ as the password reference. */
-GByteArray *pace_build_mse_set_at(gboolean use_can);
+/* MSE:Set AT: 00 22 C1 A4, selecting the given PACEInfo protocol OID
+ * (see pace_oid_supported()) and either CAN (use_can) or MRZ as the
+ * password reference. */
+GByteArray *pace_build_mse_set_at(const guint8 *oid, gsize oid_len, gboolean use_can);
 
 /* Round 1, Encrypted Nonce: empty General Authenticate, asks the chip to
  * return its nonce s encrypted under Kpi. */

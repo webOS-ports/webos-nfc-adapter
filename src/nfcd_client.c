@@ -178,6 +178,11 @@ struct passport_read {
 	guint8 rnd_icc[8];
 
 	/* PACE path */
+	GByteArray *pace_k;		/* password encoding, until EF.CardAccess picks a curve */
+	GByteArray *card_access;	/* accumulated EF.CardAccess bytes */
+	gsize card_access_total_len;	/* from the first chunk's TLV header */
+	guint8 pace_selected_oid[16];
+	gsize pace_selected_oid_len;
 	PaceExchange *pace;
 	PaceSession pace_session;
 
@@ -227,6 +232,10 @@ static void passport_mutual_auth_ready(GObject *source, GAsyncResult *res, gpoin
 static void passport_select_dg1_ready(GObject *source, GAsyncResult *res, gpointer user_data);
 static void passport_dg1_rest_ready(GObject *source, GAsyncResult *res, gpointer user_data);
 
+static void passport_select_ef_cardaccess_ready(GObject *source, GAsyncResult *res,
+                                                gpointer user_data);
+static void passport_ef_cardaccess_rest_ready(GObject *source, GAsyncResult *res,
+                                              gpointer user_data);
 static void pace_mse_set_at_ready(GObject *source, GAsyncResult *res, gpointer user_data);
 static void pace_get_nonce_ready(GObject *source, GAsyncResult *res, gpointer user_data);
 static void pace_map_nonce_ready(GObject *source, GAsyncResult *res, gpointer user_data);
@@ -1088,6 +1097,11 @@ static void tag_read_start(struct nfcd_client *client, const char *path)
  * after PACE's handshake (see pace_mutual_auth_ready()). */
 static const guint8 pace_emrtd_aid[] = { 0xA0, 0x00, 0x00, 0x02, 0x47, 0x10, 0x01 };
 
+/* EF.CardAccess's well-known FID (ICAO 9303-11 4.1) - readable
+ * unauthenticated, at the MF, before PACE's MSE:Set AT. */
+static const guint8 ef_cardaccess_fid[] = { 0x01, 0x1C };
+#define EF_CARDACCESS_MAX_LEN	2048	/* generous sanity ceiling, not a real limit */
+
 static void passport_dg1_read_more(struct passport_read *read);
 
 static void passport_read_free(struct passport_read *read)
@@ -1103,6 +1117,12 @@ static void passport_read_free(struct passport_read *read)
 
 	if (read->dg1)
 		g_byte_array_free(read->dg1, TRUE);
+
+	if (read->pace_k)
+		g_byte_array_free(read->pace_k, TRUE);
+
+	if (read->card_access)
+		g_byte_array_free(read->card_access, TRUE);
 
 	if (read->pace)
 		pace_exchange_free(read->pace);
@@ -1180,9 +1200,18 @@ static void passport_tag_proxy_ready(GObject *source, GAsyncResult *res, gpointe
 
 	/* PACE runs against the MF (no app selected yet) - the eMRTD app
 	 * isn't SELECTed until after secure messaging is up (see
-	 * pace_mutual_auth_ready()). BAC selects it up front, in the clear. */
-	if (read->use_pace)
-		passport_transceive(read, pace_build_mse_set_at(TRUE), pace_mse_set_at_ready);
+	 * pace_mutual_auth_ready()). BAC selects it up front, in the clear.
+	 * PACE also needs EF.CardAccess read first, to learn which OID/curve
+	 * this document actually wants (see passport_select_ef_cardaccess_ready())
+	 * rather than guessing - MSE:Set AT follows once that's known. */
+	if (read->use_pace) {
+		GByteArray *apdu = g_byte_array_new();
+		guint8 header[] = { 0x00, 0xA4, 0x02, 0x0C, (guint8) sizeof(ef_cardaccess_fid) };
+
+		g_byte_array_append(apdu, header, sizeof(header));
+		g_byte_array_append(apdu, ef_cardaccess_fid, sizeof(ef_cardaccess_fid));
+		passport_transceive(read, apdu, passport_select_ef_cardaccess_ready);
+	}
 	else
 		passport_transceive(read, bac_build_select_aid(), passport_select_aid_ready);
 }
@@ -1308,13 +1337,185 @@ static void passport_mutual_auth_ready(GObject *source, GAsyncResult *res, gpoin
 	passport_transceive(read, apdu, passport_select_dg1_ready);
 }
 
-/* ---- PACE: MSE:Set AT, then General Authenticate rounds 1-4 (see
- * pace.h), then SELECT eMRTD app under the now-established secure
- * messaging (unlike BAC, which selects it in the clear up front). Once
- * pace_select_aid_ready() succeeds, the flow rejoins BAC's at
- * passport_select_dg1_ready() - both paths land on the same DG1 read
- * loop, just with passport_sm_response_ok() dispatching to pace_sm_*
- * instead of bac_sm_* (see read->use_pace there). ---- */
+/* ---- PACE: SELECT + read EF.CardAccess (unauthenticated - see pace.h),
+ * pick a PACEInfo entry this build can actually run, then MSE:Set AT and
+ * General Authenticate rounds 1-4 (see pace.h), then SELECT eMRTD app
+ * under the now-established secure messaging (unlike BAC, which selects
+ * it in the clear up front). Once pace_select_aid_ready() succeeds, the
+ * flow rejoins BAC's at passport_select_dg1_ready() - both paths land on
+ * the same DG1 read loop, just with passport_sm_response_ok() dispatching
+ * to pace_sm_* instead of bac_sm_* (see read->use_pace there). ---- */
+
+static void passport_select_ef_cardaccess_ready(GObject *source, GAsyncResult *res,
+                                                gpointer user_data)
+{
+	struct passport_read *read = user_data;
+	GError *error = NULL;
+	GVariant *response = NULL;
+	gboolean ok;
+	GByteArray *apdu;
+	guint8 cmd[] = { 0x00, 0xB0, 0x00, 0x00, 0x00 };	/* Le=0 -> up to 256 bytes */
+
+	ok = nfcd_interface_tag_call_transceive_finish(NFCD_INTERFACE_TAG(source),
+	                                               &response, res, &error);
+	if (!ok) {
+		g_error_free(error);
+		passport_read_finish(read, FALSE, "Failed to reach the tag", NULL);
+		return;
+	}
+
+	{
+		gsize len = 0;
+		const guint8 *bytes = g_variant_get_fixed_array(response, &len, 1);
+		gboolean sel_ok = passport_raw_response_ok(bytes, len, 0, NULL);
+
+		g_variant_unref(response);
+		if (!sel_ok) {
+			passport_read_finish(read, FALSE,
+				"Could not select EF.CardAccess - this document doesn't "
+				"expose its PACE parameters where expected", NULL);
+			return;
+		}
+	}
+
+	read->card_access = g_byte_array_new();
+	apdu = g_byte_array_new();
+	g_byte_array_append(apdu, cmd, sizeof(cmd));
+	passport_transceive(read, apdu, passport_ef_cardaccess_rest_ready);
+}
+
+/* Picks a PACEInfo entry this build can run out of everything
+ * pace_parse_card_access() found, sets up read->pace on success. Returns
+ * NULL on success; otherwise a caller-owned (g_free()) error string
+ * identifying exactly what was found, if anything. */
+static gchar *passport_pick_pace_entry(struct passport_read *read)
+{
+	PaceInfoEntry entries[8];
+	gsize count = pace_parse_card_access(read->card_access->data, read->card_access->len,
+	                                     entries, G_N_ELEMENTS(entries));
+	gsize i;
+
+	for (i = 0; i < count; i++) {
+		int curve_nid;
+
+		if (!pace_oid_supported(entries[i].oid, entries[i].oid_len))
+			continue;
+		curve_nid = pace_ec_curve_for_parameter_id(entries[i].parameter_id);
+		if (curve_nid == 0)
+			continue;
+
+		read->pace = pace_exchange_new(read->pace_k, curve_nid);
+		g_byte_array_free(read->pace_k, TRUE);
+		read->pace_k = NULL;
+		if (!read->pace)
+			return g_strdup("Failed to set up the PACE exchange");
+
+		memcpy(read->pace_selected_oid, entries[i].oid, entries[i].oid_len);
+		read->pace_selected_oid_len = entries[i].oid_len;
+		return NULL;
+	}
+
+	if (count == 0)
+		return g_strdup("This document's EF.CardAccess didn't list any PACE "
+		                "support (SecurityInfos empty or unparseable)");
+
+	/* Name exactly what was found and rejected, e.g. "protocol=...
+	 * parameterId=192" - so a real rejection here is a precise
+	 * diagnostic, not another guessing round. */
+	{
+		GString *msg = g_string_new(
+			"This document's PACEInfo doesn't match anything this build "
+			"supports (only ECDH-GM-AES-128 on NIST P-256 or "
+			"brainpoolP256r1 - see pace.h). Found: ");
+
+		for (i = 0; i < count; i++) {
+			gsize j;
+
+			if (i > 0)
+				g_string_append(msg, "; ");
+			g_string_append(msg, "protocol=");
+			for (j = 0; j < entries[i].oid_len; j++)
+				g_string_append_printf(msg, "%02X", entries[i].oid[j]);
+			if (entries[i].parameter_id >= 0)
+				g_string_append_printf(msg, " parameterId=%d",
+					entries[i].parameter_id);
+		}
+		return g_string_free(msg, FALSE);
+	}
+}
+
+static void passport_ef_cardaccess_rest_ready(GObject *source, GAsyncResult *res,
+                                              gpointer user_data)
+{
+	struct passport_read *read = user_data;
+	GError *error = NULL;
+	GVariant *response = NULL;
+	gboolean ok;
+
+	ok = nfcd_interface_tag_call_transceive_finish(NFCD_INTERFACE_TAG(source),
+	                                               &response, res, &error);
+	if (!ok) {
+		g_error_free(error);
+		passport_read_finish(read, FALSE, "Failed to reach the tag", NULL);
+		return;
+	}
+
+	{
+		gsize len = 0;
+		const guint8 *bytes = g_variant_get_fixed_array(response, &len, 1);
+		gboolean sw_ok = len >= 2 && bytes[len - 2] == 0x90 && bytes[len - 1] == 0x00;
+
+		if (!sw_ok || len < 3) {
+			g_variant_unref(response);
+			passport_read_finish(read, FALSE,
+				"Failed to read EF.CardAccess", NULL);
+			return;
+		}
+		g_byte_array_append(read->card_access, bytes, len - 2);
+		g_variant_unref(response);
+	}
+
+	if (read->card_access_total_len == 0) {
+		gsize header_len, content_len;
+
+		if (!bac_ber_tlv_header(read->card_access->data, read->card_access->len,
+		                        &header_len, &content_len) ||
+		    header_len + content_len > EF_CARDACCESS_MAX_LEN) {
+			passport_read_finish(read, FALSE,
+				"EF.CardAccess has an unexpected structure", NULL);
+			return;
+		}
+		read->card_access_total_len = header_len + content_len;
+	}
+
+	if (read->card_access->len < read->card_access_total_len) {
+		GByteArray *apdu = g_byte_array_new();
+		guint offset = (guint) read->card_access->len;
+		gsize remaining = read->card_access_total_len - read->card_access->len;
+		guint8 cmd[] = { 0x00, 0xB0, (guint8)(offset >> 8), (guint8)(offset & 0xFF),
+		                (guint8) MIN(remaining, 255) };
+
+		g_byte_array_append(apdu, cmd, sizeof(cmd));
+		passport_transceive(read, apdu, passport_ef_cardaccess_rest_ready);
+		return;
+	}
+
+	{
+		gchar *err = passport_pick_pace_entry(read);
+		GByteArray *apdu;
+
+		if (err) {
+			/* passport_read_finish() calls cb() synchronously and it
+			 * copies error_text before returning - safe to free after. */
+			passport_read_finish(read, FALSE, err, NULL);
+			g_free(err);
+			return;
+		}
+		apdu = pace_build_mse_set_at(read->pace_selected_oid,
+		                             read->pace_selected_oid_len, TRUE);
+		passport_transceive(read, apdu, pace_mse_set_at_ready);
+	}
+}
 
 static void pace_mse_set_at_ready(GObject *source, GAsyncResult *res, gpointer user_data)
 {
@@ -1338,10 +1539,13 @@ static void pace_mse_set_at_ready(GObject *source, GAsyncResult *res, gpointer u
 
 		g_variant_unref(response);
 		if (!set_ok) {
+			/* Unexpected: EF.CardAccess just said this OID/curve is
+			 * exactly what the document wants (see
+			 * passport_pick_pace_entry()) - a rejection here means
+			 * something other than a wrong-parameter guess. */
 			passport_read_finish(read, FALSE,
-				"This document doesn't support PACE with the parameters "
-				"this implementation assumes (ECDH-GM-AES128, "
-				"brainpoolP256r1) - see pace.h", NULL);
+				"MSE:Set AT was rejected even with this document's own "
+				"advertised PACE parameters", NULL);
 			return;
 		}
 	}
@@ -1776,7 +1980,6 @@ void nfcd_client_read_passport_pace(struct nfcd_client *client, const char *can,
 {
 	struct passport_read *read;
 	GByteArray *k;
-	PaceExchange *pace;
 
 	if (!passport_read_precheck(client, cb, user_data))
 		return;
@@ -1788,16 +1991,12 @@ void nfcd_client_read_passport_pace(struct nfcd_client *client, const char *can,
 		return;
 	}
 
-	pace = pace_exchange_new(k);
-	g_byte_array_free(k, TRUE);
-	if (!pace) {
-		cb(FALSE, "Failed to set up the PACE exchange", NULL, user_data);
-		return;
-	}
-
+	/* The actual PaceExchange (which needs a curve) isn't set up until
+	 * EF.CardAccess says which one this document wants - see
+	 * passport_pick_pace_entry(). k is kept until then. */
 	read = g_new0(struct passport_read, 1);
 	read->use_pace = TRUE;
-	read->pace = pace;
+	read->pace_k = k;
 	passport_read_dispatch(client, read, cb, user_data);
 }
 
