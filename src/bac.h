@@ -127,6 +127,46 @@ gboolean bac_sm_unprotect(BacSession *session, const guint8 *rapdu, gsize rapdu_
 gchar *bac_parse_dg1_mrz(const guint8 *dg1, gsize dg1_len);
 
 /*
+ * MRZ text (as returned by bac_parse_dg1_mrz()) broken into named fields.
+ * The *_check_ok flags reflect that field's own MRZ check digit - FALSE
+ * doesn't block anything, it just means don't trust that field blindly.
+ */
+typedef struct {
+	gchar document_type[3];	/* e.g. "P<", "I<" */
+	gchar issuing_state[4];
+	gchar surname[64];
+	gchar given_names[64];
+	gchar document_number[10];
+	gchar nationality[4];
+	gchar date_of_birth[7];	/* YYMMDD */
+	gchar sex[2];			/* "M", "F" or "<" */
+	gchar date_of_expiry[7];	/* YYMMDD */
+	gboolean document_number_check_ok;
+	gboolean date_of_birth_check_ok;
+	gboolean date_of_expiry_check_ok;
+} MrzFields;
+
+/*
+ * Splits an MRZ string into MrzFields. Detects TD1 (90 chars, 3 lines of
+ * 30 - ID cards) vs TD3 (88 chars, 2 lines of 44 - passports) by length,
+ * per 9303-5/9303-4; any other length fails. The MRZ's own lines have no
+ * separators between them (see bac_parse_dg1_mrz()), so length alone is
+ * enough to tell them apart.
+ */
+gboolean bac_parse_mrz_fields(const gchar *mrz, MrzFields *out);
+
+/*
+ * EF.DG2 (the facial photo) is a CBEFF-wrapped ISO/IEC 19794-5 Face
+ * record, not a bare image file. Rather than parse that whole structure,
+ * this scans for the embedded image's own magic bytes (JPEG or JPEG2000)
+ * and returns everything from there to the end of dg2 - the image is the
+ * last variable-length field in the record, nothing follows it. Returns
+ * NULL if no recognized image magic is found. *format_out (on success) is
+ * a static string, "jpeg" or "jpeg2000" - do not free it.
+ */
+GByteArray *bac_extract_dg2_photo(const guint8 *dg2, gsize dg2_len, const gchar **format_out);
+
+/*
  * Reads the length of a BER-TLV tag+length header starting at data[0] and
  * returns the number of header bytes (tag+length encoding) via
  * *header_len_out and the declared content length via *content_len_out.
