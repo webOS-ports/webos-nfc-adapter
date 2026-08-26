@@ -259,6 +259,9 @@ static bool _service_write_tag_cb(LSHandle *handle, LSMessage *message, void *us
 	struct nfc_service *service = user_data;
 	jvalue_ref parsed_obj = NULL;
 	gchar *type = NULL, *uri = NULL, *text = NULL, *language = NULL;
+	gchar *name = NULL, *phone = NULL, *email = NULL;
+	gchar *ssid = NULL, *password = NULL, *auth = NULL, *encryption = NULL;
+	gchar *mac_address = NULL, *device_name = NULL;
 	GByteArray *ndef_message = NULL;
 
 	parsed_obj = luna_service_message_parse_and_validate(LSMessageGetPayload(message));
@@ -271,6 +274,15 @@ static bool _service_write_tag_cb(LSHandle *handle, LSMessage *message, void *us
 	uri = get_string_param(parsed_obj, "uri");
 	text = get_string_param(parsed_obj, "text");
 	language = get_string_param(parsed_obj, "language");
+	name = get_string_param(parsed_obj, "name");
+	phone = get_string_param(parsed_obj, "phone");
+	email = get_string_param(parsed_obj, "email");
+	ssid = get_string_param(parsed_obj, "ssid");
+	password = get_string_param(parsed_obj, "password");
+	auth = get_string_param(parsed_obj, "auth");
+	encryption = get_string_param(parsed_obj, "encryption");
+	mac_address = get_string_param(parsed_obj, "macAddress");
+	device_name = get_string_param(parsed_obj, "deviceName");
 
 	j_release(&parsed_obj);
 
@@ -278,10 +290,19 @@ static bool _service_write_tag_cb(LSHandle *handle, LSMessage *message, void *us
 		ndef_message = ndef_build_uri_message(uri);
 	else if (!g_strcmp0(type, "text") && text)
 		ndef_message = ndef_build_text_message(text, language);
+	else if (!g_strcmp0(type, "vcard") && name)
+		ndef_message = ndef_build_vcard_message(name, phone, email);
+	else if (!g_strcmp0(type, "wifi") && ssid)
+		ndef_message = ndef_build_wifi_message(ssid, password, auth, encryption);
+	else if (!g_strcmp0(type, "bluetooth") && mac_address)
+		ndef_message = ndef_build_bluetooth_message(mac_address, device_name);
 
 	if (!ndef_message) {
 		luna_service_message_reply_custom_error(handle, message,
-			"Expected type \"uri\" with a uri, or type \"text\" with a text");
+			"Expected type \"uri\" with a uri, type \"text\" with a text, "
+			"type \"vcard\" with a name (phone/email optional), "
+			"type \"wifi\" with a ssid (password/auth/encryption optional), "
+			"or type \"bluetooth\" with a macAddress (deviceName optional)");
 		goto cleanup;
 	}
 
@@ -295,6 +316,87 @@ cleanup:
 	g_free(uri);
 	g_free(text);
 	g_free(language);
+	g_free(name);
+	g_free(phone);
+	g_free(email);
+	g_free(ssid);
+	g_free(password);
+	g_free(auth);
+	g_free(encryption);
+	g_free(mac_address);
+	g_free(device_name);
+
+	return true;
+}
+
+static void lock_tag_result_cb(gboolean success, const char *error_text, void *user_data)
+{
+	struct nfc_request *req = user_data;
+
+	if (success)
+		luna_service_message_reply_success(req->handle, req->message);
+	else
+		luna_service_message_reply_custom_error(req->handle, req->message,
+		                                        error_text ? error_text : "Failed to lock tag");
+
+	nfc_request_free(req);
+}
+
+static bool _service_lock_tag_cb(LSHandle *handle, LSMessage *message, void *user_data)
+{
+	struct nfc_service *service = user_data;
+
+	nfcd_client_lock_tag(service->client, lock_tag_result_cb,
+	                     nfc_request_new(handle, message));
+
+	return true;
+}
+
+static void clone_tag_result_cb(gboolean success, const char *error_text, void *user_data)
+{
+	struct nfc_request *req = user_data;
+
+	if (success)
+		luna_service_message_reply_success(req->handle, req->message);
+	else
+		luna_service_message_reply_custom_error(req->handle, req->message,
+		                                        error_text ? error_text : "Failed to clone tag");
+
+	nfc_request_free(req);
+}
+
+static bool _service_clone_tag_cb(LSHandle *handle, LSMessage *message, void *user_data)
+{
+	struct nfc_service *service = user_data;
+	jvalue_ref parsed_obj = NULL;
+	gchar *raw_data_hex = NULL;
+	GByteArray *raw_data;
+
+	parsed_obj = luna_service_message_parse_and_validate(LSMessageGetPayload(message));
+	if (!parsed_obj) {
+		luna_service_message_reply_error_bad_json(handle, message);
+		return true;
+	}
+
+	/* Expected to be the "rawDataHex" field from an earlier getTagInfo
+	 * response for the tag being cloned - see cloneTag's doc comment */
+	raw_data_hex = get_string_param(parsed_obj, "rawDataHex");
+
+	j_release(&parsed_obj);
+
+	raw_data = ndef_hex_to_bytes(raw_data_hex);
+	g_free(raw_data_hex);
+
+	if (!raw_data) {
+		luna_service_message_reply_custom_error(handle, message,
+			"Expected rawDataHex, the raw byte string read from the source tag");
+		return true;
+	}
+
+	nfcd_client_write_raw(service->client, raw_data,
+	                      clone_tag_result_cb, nfc_request_new(handle, message));
+
+	g_byte_array_free(raw_data, TRUE);
 
 	return true;
 }
@@ -304,6 +406,8 @@ static LSMethod _nfc_service_methods[] = {
 	{ "setEnabled", _service_set_enabled_cb },
 	{ "getTagInfo", _service_get_tag_info_cb },
 	{ "writeTag", _service_write_tag_cb },
+	{ "lockTag", _service_lock_tag_cb },
+	{ "cloneTag", _service_clone_tag_cb },
 	{ NULL, NULL },
 };
 

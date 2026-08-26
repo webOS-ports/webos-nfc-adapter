@@ -16,6 +16,7 @@
 *
 * LICENSE@@@ */
 
+#include <stdio.h>
 #include <string.h>
 
 #include "ndef.h"
@@ -463,6 +464,258 @@ GByteArray *ndef_build_text_message(const char *text, const char *language)
 	g_byte_array_free(payload, TRUE);
 
 	return message;
+}
+
+/*
+ * The MIME-type / media-type records below (vCard, Wi-Fi, Bluetooth) are all
+ * a single short record whose TNF is NDEF_TNF_MEDIA_TYPE and whose "type" is
+ * the MIME string itself, which build_single_record already handles - only
+ * the payload encoding differs per format.
+ */
+
+GByteArray *ndef_build_vcard_message(const char *name, const char *phone,
+                                     const char *email)
+{
+	GByteArray *message;
+	GString *vcard;
+
+	if (!name || !*name)
+		return NULL;
+
+	vcard = g_string_new("BEGIN:VCARD\r\nVERSION:3.0\r\n");
+	g_string_append_printf(vcard, "N:;%s;;;\r\n", name);
+	g_string_append_printf(vcard, "FN:%s\r\n", name);
+
+	if (phone && *phone)
+		g_string_append_printf(vcard, "TEL:%s\r\n", phone);
+
+	if (email && *email)
+		g_string_append_printf(vcard, "EMAIL:%s\r\n", email);
+
+	g_string_append(vcard, "END:VCARD\r\n");
+
+	message = build_single_record(NDEF_TNF_MEDIA_TYPE, "text/vcard",
+	                              (const guint8 *) vcard->str, vcard->len);
+
+	g_string_free(vcard, TRUE);
+
+	return message;
+}
+
+/* WSC attribute IDs, Wi-Fi Simple Configuration Technical Specification */
+#define WSC_ATTR_SSID			0x1045
+#define WSC_ATTR_AUTH_TYPE		0x1003
+#define WSC_ATTR_ENCRYPTION_TYPE	0x100f
+#define WSC_ATTR_NETWORK_KEY	0x1027
+#define WSC_ATTR_MAC_ADDRESS	0x1020
+#define WSC_ATTR_CREDENTIAL		0x100e
+
+static void wsc_append_tlv(GByteArray *out, guint16 type, const guint8 *value, guint16 len)
+{
+	guint8 header[4];
+
+	header[0] = (guint8) (type >> 8);
+	header[1] = (guint8) (type & 0xff);
+	header[2] = (guint8) (len >> 8);
+	header[3] = (guint8) (len & 0xff);
+
+	g_byte_array_append(out, header, 4);
+	if (len > 0)
+		g_byte_array_append(out, value, len);
+}
+
+static void wsc_append_tlv_u16(GByteArray *out, guint16 type, guint16 value)
+{
+	guint8 be[2];
+
+	be[0] = (guint8) (value >> 8);
+	be[1] = (guint8) (value & 0xff);
+
+	wsc_append_tlv(out, type, be, 2);
+}
+
+/* Case-insensitive match against a handful of tokens people actually type */
+static gboolean token_is(const char *value, const char *candidate)
+{
+	return value && g_ascii_strcasecmp(value, candidate) == 0;
+}
+
+static guint16 wsc_auth_type(const char *auth)
+{
+	if (token_is(auth, "Open") || token_is(auth, "None"))
+		return 0x0001;
+	if (token_is(auth, "WPA-Personal") || token_is(auth, "WPA"))
+		return 0x0002;
+	if (token_is(auth, "WPA2-Personal") || token_is(auth, "WPA2"))
+		return 0x0020;
+
+	/* Most home APs today; a reasonable default for an unrecognised token */
+	return 0x0022; /* WPA/WPA2-Personal */
+}
+
+static guint16 wsc_encryption_type(const char *encryption)
+{
+	if (token_is(encryption, "None"))
+		return 0x0001;
+	if (token_is(encryption, "WEP"))
+		return 0x0002;
+	if (token_is(encryption, "TKIP"))
+		return 0x0004;
+	if (token_is(encryption, "AES"))
+		return 0x0008;
+
+	return 0x000c; /* AES+TKIP, the common "just works" default */
+}
+
+GByteArray *ndef_build_wifi_message(const char *ssid, const char *password,
+                                    const char *auth, const char *encryption)
+{
+	GByteArray *message;
+	GByteArray *credential;
+	GByteArray *payload;
+	static const guint8 broadcast_mac[6] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
+
+	if (!ssid || !*ssid || strlen(ssid) > 32)
+		return NULL;
+
+	if (password && strlen(password) > 64)
+		return NULL;
+
+	credential = g_byte_array_new();
+
+	wsc_append_tlv(credential, WSC_ATTR_SSID, (const guint8 *) ssid, (guint16) strlen(ssid));
+	wsc_append_tlv_u16(credential, WSC_ATTR_AUTH_TYPE, wsc_auth_type(auth));
+	wsc_append_tlv_u16(credential, WSC_ATTR_ENCRYPTION_TYPE, wsc_encryption_type(encryption));
+
+	if (password && *password)
+		wsc_append_tlv(credential, WSC_ATTR_NETWORK_KEY,
+		              (const guint8 *) password, (guint16) strlen(password));
+
+	wsc_append_tlv(credential, WSC_ATTR_MAC_ADDRESS, broadcast_mac, 6);
+
+	payload = g_byte_array_new();
+	wsc_append_tlv(payload, WSC_ATTR_CREDENTIAL, credential->data, (guint16) credential->len);
+
+	message = build_single_record(NDEF_TNF_MEDIA_TYPE, "application/vnd.wfa.wsc",
+	                              payload->data, payload->len);
+
+	g_byte_array_free(credential, TRUE);
+	g_byte_array_free(payload, TRUE);
+
+	return message;
+}
+
+/* Parses "AA:BB:CC:DD:EE:FF" into 6 bytes in that (normal) order */
+static gboolean parse_mac_address(const char *text, guint8 out[6])
+{
+	guint values[6];
+	int n;
+
+	if (!text)
+		return FALSE;
+
+	n = sscanf(text, "%x:%x:%x:%x:%x:%x",
+	          &values[0], &values[1], &values[2],
+	          &values[3], &values[4], &values[5]);
+
+	if (n != 6)
+		return FALSE;
+
+	for (n = 0; n < 6; n++) {
+		if (values[n] > 0xff)
+			return FALSE;
+		out[n] = (guint8) values[n];
+	}
+
+	return TRUE;
+}
+
+GByteArray *ndef_build_bluetooth_message(const char *mac_address,
+                                         const char *device_name)
+{
+	GByteArray *message;
+	GByteArray *payload;
+	guint8 mac[6];
+	guint16 total_len;
+	guint8 len16[2];
+	gsize name_len = 0;
+
+	if (!parse_mac_address(mac_address, mac))
+		return NULL;
+
+	if (device_name)
+		name_len = strlen(device_name);
+
+	/* Bluetooth addresses go on the wire least-significant-octet first */
+	payload = g_byte_array_new();
+
+	/* Total length placeholder, filled in once the real size is known */
+	len16[0] = len16[1] = 0;
+	g_byte_array_append(payload, len16, 2);
+
+	{
+		guint8 reversed[6];
+		int n;
+
+		for (n = 0; n < 6; n++)
+			reversed[n] = mac[5 - n];
+
+		g_byte_array_append(payload, reversed, 6);
+	}
+
+	if (name_len > 0 && name_len <= 0xfc) {
+		guint8 eir_header[2];
+
+		/* EIR length byte counts the type byte plus the name itself */
+		eir_header[0] = (guint8) (name_len + 1);
+		eir_header[1] = 0x09; /* Complete Local Name */
+
+		g_byte_array_append(payload, eir_header, 2);
+		g_byte_array_append(payload, (const guint8 *) device_name, name_len);
+	}
+
+	/* OOB length field covers everything after itself */
+	total_len = (guint16) (payload->len - 2);
+	payload->data[0] = (guint8) (total_len & 0xff);
+	payload->data[1] = (guint8) (total_len >> 8);
+
+	message = build_single_record(NDEF_TNF_MEDIA_TYPE, "application/vnd.bluetooth.ep.oob",
+	                              payload->data, payload->len);
+
+	g_byte_array_free(payload, TRUE);
+
+	return message;
+}
+
+GByteArray *ndef_hex_to_bytes(const char *hex)
+{
+	GByteArray *bytes;
+	gsize len, n;
+
+	if (!hex)
+		return NULL;
+
+	len = strlen(hex);
+	if (len == 0 || (len % 2) != 0)
+		return NULL;
+
+	bytes = g_byte_array_sized_new((guint) (len / 2));
+
+	for (n = 0; n < len; n += 2) {
+		gint hi = g_ascii_xdigit_value(hex[n]);
+		gint lo = g_ascii_xdigit_value(hex[n + 1]);
+		guint8 byte;
+
+		if (hi < 0 || lo < 0) {
+			g_byte_array_free(bytes, TRUE);
+			return NULL;
+		}
+
+		byte = (guint8) ((hi << 4) | lo);
+		g_byte_array_append(bytes, &byte, 1);
+	}
+
+	return bytes;
 }
 
 GByteArray *ndef_wrap_type2_tlv(const GByteArray *message)

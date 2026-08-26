@@ -47,9 +47,37 @@ jvalue_ref ndef_record_to_json(guint tnf, const guint8 *type, gsize type_len,
  */
 jvalue_ref ndef_message_to_json(const guint8 *data, gsize len);
 
-/* Encoders used by writeTag. Both return a single record message. */
+/* Encoders used by writeTag. All return a single record message. */
 GByteArray *ndef_build_uri_message(const char *uri);
 GByteArray *ndef_build_text_message(const char *text, const char *language);
+
+/**
+ * MECARD-style vCard contact record (TNF media type "text/vcard"), the same
+ * format Android and iOS write for "share contact via NFC".
+ */
+GByteArray *ndef_build_vcard_message(const char *name, const char *phone,
+                                     const char *email);
+
+/**
+ * Wi-Fi Simple Config credential record (TNF media type
+ * "application/vnd.wfa.wsc"), NFCForum-AD-WIFI_1.1. auth and encryption are
+ * the WSC token strings: auth is one of "Open", "WPA-Personal",
+ * "WPA2-Personal" (etc, see WSC_AUTH_* in ndef.c); encryption is one of
+ * "None", "WEP", "TKIP", "AES" (etc, see WSC_ENC_*).
+ */
+GByteArray *ndef_build_wifi_message(const char *ssid, const char *password,
+                                    const char *auth, const char *encryption);
+
+/**
+ * Bluetooth Secure Simple Pairing OOB record (TNF media type
+ * "application/vnd.bluetooth.ep.oob"), NFCForum-AD-BTSSP_1.1. mac_address is
+ * "AA:BB:CC:DD:EE:FF"; device_name may be NULL.
+ */
+GByteArray *ndef_build_bluetooth_message(const char *mac_address,
+                                         const char *device_name);
+
+/* Inverse of ndef_bytes_to_hex. Returns NULL if hex isn't valid/even length. */
+GByteArray *ndef_hex_to_bytes(const char *hex);
 
 /**
  * Wraps an NDEF message in the Type 2 tag NDEF Message TLV (tag 0x03) and

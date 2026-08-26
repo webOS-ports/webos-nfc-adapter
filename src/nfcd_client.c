@@ -29,6 +29,9 @@
 
 #define TAG_IFACE_TYPE2			"org.sailfishos.nfc.TagType2"
 
+/* NfcTag.type value for MIFARE Classic (nfc_types.h NFC_TAG_TYPE enum) */
+#define NFC_TAG_TYPE_MIFARE_CLASSIC	2
+
 /* org.sailfishos.nfc.Daemon polling bit: see Daemon.xml */
 #define NFCD_MODE_READER_WRITER	0x02
 
@@ -75,12 +78,41 @@ struct nfcd_client {
 	jvalue_ref tag_json;
 	struct tag_read *reading;
 
+	/* MIFARE Classic keys that worked before, by tag UID (hex string) ->
+	 * struct mifare_key_cache_entry*, so re-taps of the same physical
+	 * tag skip straight to the known key instead of re-guessing. */
+	GHashTable *mifare_key_cache;
+
 	nfcd_state_cb state_cb;
 	nfcd_tag_cb tag_cb;
 	void *user_data;
 };
 
-/* One sequential walk over a tag and its NDEF records */
+#define MIFARE_KEY_LEN 6
+#define MIFARE_NUM_SECTORS 40
+
+/*
+ * Well-known, publicly-documented default MIFARE Classic keys only
+ * (factory default, NFC Forum MAD, NFC Forum NDEF, blank/programmer) -
+ * deliberately not a key-cracking attempt. A sector using any other key
+ * (as any real transit/payment card will) is simply left unread.
+ */
+static const guint8 mifare_default_keys[][MIFARE_KEY_LEN] = {
+	{ 0xff, 0xff, 0xff, 0xff, 0xff, 0xff },
+	{ 0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5 },
+	{ 0xd3, 0xf7, 0xd3, 0xf7, 0xd3, 0xf7 },
+	{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
+};
+#define MIFARE_NUM_DEFAULT_KEYS (G_N_ELEMENTS(mifare_default_keys))
+
+/* Per-UID cache of keys that authenticated successfully before */
+struct mifare_key_cache_entry {
+	guint8 keys[MIFARE_NUM_SECTORS][MIFARE_KEY_LEN];
+	gboolean has_key[MIFARE_NUM_SECTORS];
+};
+
+/* One sequential walk over a tag and its NDEF records (or, for MIFARE
+ * Classic, its sectors - see tag_read_mifare_start()) */
 struct tag_read {
 	struct nfcd_client *client;		/* NULL once orphaned */
 	gchar *path;
@@ -91,6 +123,17 @@ struct tag_read {
 	guint record_index;
 	gboolean is_type2;
 	GCancellable *cancellable;
+
+	gboolean is_mifare;
+	gchar *mifare_uid;		/* hex NFCID1, used as the cache key */
+	guint mifare_sector;
+	guint mifare_key_index;
+	guint mifare_auth_type;	/* 0 = key A (0x60), 1 = key B (0x61) */
+	guint mifare_block_offset;	/* block within the sector, once authed */
+	guint8 mifare_key[MIFARE_KEY_LEN];
+	gboolean mifare_cached_attempt;	/* trying the cached key for this sector */
+	jvalue_ref mifare_sectors_arr;
+	jvalue_ref mifare_blocks_arr;
 };
 
 struct write_req {
@@ -115,6 +158,15 @@ struct simple_req {
 static void tag_read_start(struct nfcd_client *client, const char *path);
 static void tag_read_next_record(struct tag_read *read);
 static void tag_read_free(struct tag_read *read);
+static void tag_read_finish(struct tag_read *read);
+
+static void tag_read_mifare_start(struct tag_read *read);
+static void tag_read_mifare_next_sector(struct tag_read *read);
+static void tag_read_mifare_try_key(struct tag_read *read);
+static void mifare_read_block(struct tag_read *read, guint block);
+static void mifare_sector_done(struct tag_read *read);
+static void mifare_publish_progress(struct tag_read *read);
+static gboolean mifare_try_cached_key(struct tag_read *read);
 
 static void notify_state(struct nfcd_client *client)
 {
@@ -212,6 +264,7 @@ static const char *protocol_to_string(guint protocol)
 	case 8: return "t4a";
 	case 16: return "t4b";
 	case 32: return "nfc-dep";
+	case 64: return "mifare-classic";
 	default: return "unknown";
 	}
 }
@@ -252,7 +305,14 @@ static void tag_read_free(struct tag_read *read)
 	if (read->records_arr)
 		j_release(&read->records_arr);
 
+	if (read->mifare_sectors_arr)
+		j_release(&read->mifare_sectors_arr);
+
+	if (read->mifare_blocks_arr)
+		j_release(&read->mifare_blocks_arr);
+
 	g_strfreev(read->record_paths);
+	g_free(read->mifare_uid);
 	g_free(read->path);
 	g_free(read);
 }
@@ -271,6 +331,11 @@ static void tag_read_finish(struct tag_read *read)
 {
 	struct nfcd_client *client = read->client;
 
+	if (!client) {
+		tag_read_free(read);
+		return;
+	}
+
 	jobject_put(read->tag_obj, J_CSTR_TO_JVAL("records"), read->records_arr);
 	read->records_arr = NULL;
 
@@ -286,6 +351,346 @@ static void tag_read_finish(struct tag_read *read)
 	tag_read_free(read);
 
 	notify_tag(client);
+}
+
+/*
+ * MIFARE Classic auth+read. Sectors 0-31 have 4 blocks each; sectors
+ * 32-39 (only present on 4K cards) have 16 blocks each - standard MIFARE
+ * Classic layout, not vendor-specific.
+ */
+static guint mifare_sector_first_block(guint sector)
+{
+	return (sector < 32) ? sector * 4 : 128 + (sector - 32) * 16;
+}
+
+static guint mifare_sector_block_count(guint sector)
+{
+	return (sector < 32) ? 4 : 16;
+}
+
+static gboolean mifare_cache_lookup(struct nfcd_client *client, const gchar *uid,
+                                    guint sector, guint8 *key_out)
+{
+	struct mifare_key_cache_entry *entry;
+
+	if (!uid || !client->mifare_key_cache)
+		return FALSE;
+
+	entry = g_hash_table_lookup(client->mifare_key_cache, uid);
+	if (entry && entry->has_key[sector]) {
+		memcpy(key_out, entry->keys[sector], MIFARE_KEY_LEN);
+		return TRUE;
+	}
+	return FALSE;
+}
+
+static void mifare_cache_store(struct nfcd_client *client, const gchar *uid,
+                               guint sector, const guint8 *key)
+{
+	struct mifare_key_cache_entry *entry;
+
+	if (!uid || !client->mifare_key_cache)
+		return;
+
+	entry = g_hash_table_lookup(client->mifare_key_cache, uid);
+	if (!entry) {
+		entry = g_new0(struct mifare_key_cache_entry, 1);
+		g_hash_table_insert(client->mifare_key_cache, g_strdup(uid), entry);
+	}
+	memcpy(entry->keys[sector], key, MIFARE_KEY_LEN);
+	entry->has_key[sector] = TRUE;
+}
+
+static void tag_read_mifare_start(struct tag_read *read)
+{
+	read->is_mifare = TRUE;
+	read->mifare_sector = 0;
+	read->mifare_sectors_arr = jarray_create(NULL);
+	tag_read_mifare_next_sector(read);
+}
+
+/*
+ * A full sector sweep can take a while (see MIFARE_TAG_TIMEOUT_SEC in
+ * libnciplugin's nci_adapter.c). Publish a snapshot of whatever has been
+ * found so far after each sector, so getTagInfo subscribers see progress
+ * instead of nothing until the whole sweep completes.
+ */
+static void mifare_publish_progress(struct tag_read *read)
+{
+	jvalue_ref snapshot;
+
+	if (!read->client)
+		return;
+
+	snapshot = jvalue_duplicate(read->tag_obj);
+	jobject_put(snapshot, J_CSTR_TO_JVAL("sectors"),
+	            jvalue_duplicate(read->mifare_sectors_arr));
+	jobject_put(snapshot, J_CSTR_TO_JVAL("scanning"), jboolean_create(TRUE));
+
+	if (read->client->tag_json)
+		j_release(&read->client->tag_json);
+	read->client->tag_json = snapshot;
+
+	notify_tag(read->client);
+}
+
+static void tag_read_mifare_next_sector(struct tag_read *read)
+{
+	if (!read->client) {
+		tag_read_free(read);
+		return;
+	}
+
+	if (read->mifare_sector >= MIFARE_NUM_SECTORS) {
+		jobject_put(read->tag_obj, J_CSTR_TO_JVAL("sectors"),
+		            read->mifare_sectors_arr);
+		read->mifare_sectors_arr = NULL;
+		jobject_put(read->tag_obj, J_CSTR_TO_JVAL("scanning"),
+		            jboolean_create(FALSE));
+		tag_read_finish(read);
+		return;
+	}
+
+	mifare_publish_progress(read);
+
+	read->mifare_key_index = 0;
+	read->mifare_auth_type = 0;
+	read->mifare_cached_attempt = FALSE;
+
+	if (!mifare_try_cached_key(read))
+		tag_read_mifare_try_key(read);
+}
+
+static void mifare_auth_ready(GObject *source, GAsyncResult *res, gpointer user_data)
+{
+	struct tag_read *read = user_data;
+	GError *error = NULL;
+	GVariant *response = NULL;
+	gboolean ok;
+
+	ok = nfcd_interface_tag_call_transceive_finish(NFCD_INTERFACE_TAG(source),
+	                                               &response, res, &error);
+
+	if (!read->client) {
+		if (response)
+			g_variant_unref(response);
+		if (error)
+			g_error_free(error);
+		tag_read_free(read);
+		return;
+	}
+
+	if (!ok) {
+		gboolean cancelled = g_error_matches(error, G_IO_ERROR,
+		                                     G_IO_ERROR_CANCELLED);
+		g_error_free(error);
+		if (cancelled) {
+			tag_read_free(read);
+		} else if (read->mifare_cached_attempt) {
+			/* Cached key no longer works (tag re-keyed?) - fall
+			 * back to the normal default-key sweep */
+			read->mifare_cached_attempt = FALSE;
+			tag_read_mifare_try_key(read);
+		} else {
+			/* Most likely just the wrong key for this sector */
+			read->mifare_key_index++;
+			tag_read_mifare_try_key(read);
+		}
+		return;
+	}
+
+	if (response)
+		g_variant_unref(response);
+
+	/*
+	 * A clean Transceive() round-trip on the auth command doesn't by
+	 * itself guarantee the key was right - the vendor HAL can signal a
+	 * failed auth with a normal-looking short response rather than a
+	 * transport error. Read the sector's first block back for real;
+	 * only actual block data confirms the key worked.
+	 */
+	read->mifare_block_offset = 0;
+	read->mifare_blocks_arr = jarray_create(NULL);
+	mifare_read_block(read, mifare_sector_first_block(read->mifare_sector));
+}
+
+static void mifare_send_auth(struct tag_read *read, const guint8 *key)
+{
+	guint8 cmd[12];
+	guint block = mifare_sector_first_block(read->mifare_sector);
+	GVariant *data;
+
+	memcpy(read->mifare_key, key, MIFARE_KEY_LEN);
+
+	/*
+	 * Vendor MIFARE auth extension command, reverse-engineered from the
+	 * NXP HAL (NxpMfcReader::BuildAuthCmd/BuildMfcCmd in
+	 * /vendor/lib64/nfc_nci_nxp.so): byte 0 = 0x60 (key A) or 0x61
+	 * (key B), byte 1 = any block number within the target sector (the
+	 * HAL derives the sector address from it internally), bytes 2-5
+	 * unused, bytes 6-11 = the 6-byte key. Total 12 bytes - the key
+	 * lands at the right offset only when the buffer is exactly this
+	 * shape, since the HAL just copies our raw input into its own
+	 * struct and reads the key back out at a fixed offset.
+	 */
+	cmd[0] = read->mifare_auth_type ? 0x61 : 0x60;
+	cmd[1] = (guint8) block;
+	memset(cmd + 2, 0, 4);
+	memcpy(cmd + 6, read->mifare_key, MIFARE_KEY_LEN);
+
+	data = g_variant_new_fixed_array(G_VARIANT_TYPE_BYTE, cmd, sizeof(cmd), 1);
+	nfcd_interface_tag_call_transceive(read->tag, data, read->cancellable,
+	                                   mifare_auth_ready, read);
+}
+
+/* Returns TRUE if a cached-key attempt was started (async, callback will
+ * fall back to the normal sweep on failure - see mifare_auth_ready()) */
+static gboolean mifare_try_cached_key(struct tag_read *read)
+{
+	guint8 key[MIFARE_KEY_LEN];
+
+	if (!mifare_cache_lookup(read->client, read->mifare_uid,
+	                         read->mifare_sector, key))
+		return FALSE;
+
+	read->mifare_cached_attempt = TRUE;
+	read->mifare_auth_type = 0;
+	mifare_send_auth(read, key);
+	return TRUE;
+}
+
+static void tag_read_mifare_try_key(struct tag_read *read)
+{
+	if (read->mifare_key_index >= MIFARE_NUM_DEFAULT_KEYS) {
+		/*
+		 * Key B is deliberately not tried by default - real-world
+		 * tags rarely need it beyond key A, and every key doubles
+		 * the worst-case sweep time (40 sectors x 4 keys is already
+		 * ~160 round-trips when nothing authenticates). Give up on
+		 * this sector and move on.
+		 */
+		read->mifare_sector++;
+		tag_read_mifare_next_sector(read);
+		return;
+	}
+
+	if (!read->client) {
+		tag_read_free(read);
+		return;
+	}
+
+	mifare_send_auth(read, mifare_default_keys[read->mifare_key_index]);
+}
+
+static void mifare_block_read_ready(GObject *source, GAsyncResult *res, gpointer user_data)
+{
+	struct tag_read *read = user_data;
+	GError *error = NULL;
+	GVariant *response = NULL;
+	gboolean ok;
+
+	ok = nfcd_interface_tag_call_transceive_finish(NFCD_INTERFACE_TAG(source),
+	                                               &response, res, &error);
+
+	if (!read->client) {
+		if (response)
+			g_variant_unref(response);
+		if (error)
+			g_error_free(error);
+		tag_read_free(read);
+		return;
+	}
+
+	if (ok) {
+		gsize len = 0;
+		const guint8 *bytes = g_variant_get_fixed_array(response, &len, 1);
+
+		/* Real MIFARE Classic blocks are exactly 16 bytes */
+		if (len == 16) {
+			gchar *hex = ndef_bytes_to_hex(bytes, len);
+
+			jarray_append(read->mifare_blocks_arr, jstring_create(hex));
+			g_free(hex);
+			g_variant_unref(response);
+
+			read->mifare_block_offset++;
+			if (read->mifare_block_offset >=
+			    mifare_sector_block_count(read->mifare_sector)) {
+				mifare_sector_done(read);
+			} else {
+				mifare_read_block(read, mifare_sector_first_block(
+					read->mifare_sector) + read->mifare_block_offset);
+			}
+			return;
+		}
+		g_variant_unref(response);
+	} else {
+		g_error_free(error);
+	}
+
+	if (read->mifare_block_offset == 0) {
+		/* Wrong key after all - the auth round-trip looked clean but
+		 * the very first read failed. j_release() leaves the pointer
+		 * undefined (not NULL, see japi.h) - null it ourselves so
+		 * tag_read_free()'s "if (x) j_release(x)" guard doesn't see
+		 * stale garbage and release it a second time later. */
+		j_release(&read->mifare_blocks_arr);
+		read->mifare_blocks_arr = NULL;
+		if (read->mifare_cached_attempt) {
+			read->mifare_cached_attempt = FALSE;
+			tag_read_mifare_try_key(read);
+		} else {
+			read->mifare_key_index++;
+			tag_read_mifare_try_key(read);
+		}
+	} else {
+		/* Odd mid-sector hiccup on an otherwise-good key - keep what
+		 * we already read and move on rather than losing the sector */
+		mifare_sector_done(read);
+	}
+}
+
+static void mifare_read_block(struct tag_read *read, guint block)
+{
+	guint8 cmd[2];
+	GVariant *data;
+
+	/*
+	 * Standard MIFARE Classic READ (0x30 + block number), not a vendor
+	 * extension - the HAL's BuildMfcCmd default path just prefixes a
+	 * "raw frame" marker and forwards this verbatim, appending CRC as
+	 * normal. Only valid once a sector has been successfully
+	 * authenticated (see tag_read_mifare_try_key()).
+	 */
+	cmd[0] = 0x30;
+	cmd[1] = (guint8) block;
+
+	data = g_variant_new_fixed_array(G_VARIANT_TYPE_BYTE, cmd, sizeof(cmd), 1);
+	nfcd_interface_tag_call_transceive(read->tag, data, read->cancellable,
+	                                   mifare_block_read_ready, read);
+}
+
+static void mifare_sector_done(struct tag_read *read)
+{
+	jvalue_ref sector_obj = jobject_create();
+	gchar *key_hex = ndef_bytes_to_hex(read->mifare_key, MIFARE_KEY_LEN);
+
+	jobject_put(sector_obj, J_CSTR_TO_JVAL("sector"),
+	            jnumber_create_i32((int) read->mifare_sector));
+	jobject_put(sector_obj, J_CSTR_TO_JVAL("keyType"),
+	            jstring_create(read->mifare_auth_type ? "B" : "A"));
+	jobject_put(sector_obj, J_CSTR_TO_JVAL("key"), jstring_create(key_hex));
+	g_free(key_hex);
+	jobject_put(sector_obj, J_CSTR_TO_JVAL("blocks"), read->mifare_blocks_arr);
+	read->mifare_blocks_arr = NULL;
+
+	jarray_append(read->mifare_sectors_arr, sector_obj);
+
+	mifare_cache_store(read->client, read->mifare_uid, read->mifare_sector,
+	                   read->mifare_key);
+
+	read->mifare_sector++;
+	tag_read_mifare_next_sector(read);
 }
 
 static void ndef_get_all_ready(GObject *source, GAsyncResult *res, gpointer user_data)
@@ -369,12 +774,101 @@ static void ndef_proxy_ready(GObject *source, GAsyncResult *res, gpointer user_d
 	                                 ndef_get_all_ready, read);
 }
 
+/*
+ * Type 2 tags additionally get their whole data area read back as one raw
+ * hex blob ("rawDataHex" in the tag JSON), independent of however many NDEF
+ * records nfcd parsed out of it. This is what cloneTag replays verbatim to
+ * another tag: writing the individually-decoded records back out could
+ * subtly change bytes nfcd didn't have a friendly decoding for, where the
+ * raw bytes round-trip exactly.
+ */
+
+static void raw_data_ready(GObject *source, GAsyncResult *res, gpointer user_data)
+{
+	struct tag_read *read = user_data;
+	NfcdInterfaceTagType2 *type2 = NFCD_INTERFACE_TAG_TYPE2(source);
+	GError *error = NULL;
+	GVariant *data = NULL;
+
+	if (nfcd_interface_tag_type2_call_read_all_data_finish(type2, &data, res, &error)) {
+		if (read->client) {
+			gsize len = 0;
+			const guint8 *bytes = g_variant_get_fixed_array(data, &len, 1);
+			gchar *hex = ndef_bytes_to_hex(bytes, len);
+
+			jobject_put(read->tag_obj, J_CSTR_TO_JVAL("rawDataHex"), jstring_create(hex));
+			g_free(hex);
+		}
+
+		g_variant_unref(data);
+	} else {
+		/* Not fatal to the read as a whole - cloning just won't be possible */
+		if (!g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
+			g_warning("Failed to read raw tag data: %s", error->message);
+		g_error_free(error);
+	}
+
+	g_object_unref(type2);
+
+	if (!read->client) {
+		tag_read_free(read);
+		return;
+	}
+
+	tag_read_finish(read);
+}
+
+static void raw_data_proxy_ready(GObject *source, GAsyncResult *res, gpointer user_data)
+{
+	struct tag_read *read = user_data;
+	GError *error = NULL;
+	NfcdInterfaceTagType2 *type2;
+
+	type2 = nfcd_interface_tag_type2_proxy_new_for_bus_finish(res, &error);
+
+	if (!type2) {
+		if (!g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
+			g_warning("Failed to create TagType2 proxy for raw read: %s", error->message);
+		g_error_free(error);
+
+		if (!read->client) {
+			tag_read_free(read);
+			return;
+		}
+
+		tag_read_finish(read);
+		return;
+	}
+
+	if (!read->client) {
+		g_object_unref(type2);
+		tag_read_free(read);
+		return;
+	}
+
+	nfcd_interface_tag_type2_call_read_all_data(type2, read->cancellable,
+	                                            raw_data_ready, read);
+}
+
+static void tag_read_raw_data(struct tag_read *read)
+{
+	if (!read->is_type2) {
+		tag_read_finish(read);
+		return;
+	}
+
+	nfcd_interface_tag_type2_proxy_new_for_bus(G_BUS_TYPE_SYSTEM, G_DBUS_PROXY_FLAGS_NONE,
+	                                           NFCD_DAEMON_SERVICE, read->path,
+	                                           read->cancellable,
+	                                           raw_data_proxy_ready, read);
+}
+
 static void tag_read_next_record(struct tag_read *read)
 {
 	const char *path;
 
 	if (!read->record_paths || !read->record_paths[read->record_index]) {
-		tag_read_finish(read);
+		tag_read_raw_data(read);
 		return;
 	}
 
@@ -442,10 +936,26 @@ static void tag_get_all_ready(GObject *source, GAsyncResult *res, gpointer user_
 	read->record_paths = ndef_records;
 	read->record_index = 0;
 
+	if (type == NFC_TAG_TYPE_MIFARE_CLASSIC) {
+		GVariant *nfcid1 = g_variant_lookup_value(poll_parameters, "NFCID1",
+		                                          G_VARIANT_TYPE("ay"));
+
+		if (nfcid1) {
+			gsize len = 0;
+			const guint8 *bytes = g_variant_get_fixed_array(nfcid1, &len, 1);
+
+			read->mifare_uid = ndef_bytes_to_hex(bytes, len);
+			g_variant_unref(nfcid1);
+		}
+	}
+
 	g_strfreev(interfaces);
 	g_variant_unref(poll_parameters);
 
-	tag_read_next_record(read);
+	if (type == NFC_TAG_TYPE_MIFARE_CLASSIC)
+		tag_read_mifare_start(read);
+	else
+		tag_read_next_record(read);
 }
 
 static void tag_proxy_ready(GObject *source, GAsyncResult *res, gpointer user_data)
@@ -914,6 +1424,8 @@ struct nfcd_client *nfcd_client_create(nfcd_state_cb state_cb, nfcd_tag_cb tag_c
 	client->tag_cb = tag_cb;
 	client->user_data = user_data;
 	client->cancellable = g_cancellable_new();
+	client->mifare_key_cache = g_hash_table_new_full(g_str_hash, g_str_equal,
+	                                                 g_free, g_free);
 
 	client->daemon_watch = g_bus_watch_name(G_BUS_TYPE_SYSTEM, NFCD_DAEMON_SERVICE,
 	                                        G_BUS_NAME_WATCHER_FLAGS_NONE,
@@ -957,6 +1469,9 @@ void nfcd_client_free(struct nfcd_client *client)
 
 	if (client->tag_json)
 		j_release(&client->tag_json);
+
+	if (client->mifare_key_cache)
+		g_hash_table_unref(client->mifare_key_cache);
 
 	g_object_unref(client->cancellable);
 	g_free(client->adapter_path);
@@ -1188,10 +1703,29 @@ static void write_tag_proxy_ready(GObject *source, GAsyncResult *res, gpointer u
 	                                write_acquire_ready, req);
 }
 
+/* Common to nfcd_client_write_tag and nfcd_client_write_raw: acquire the tag
+ * and write the already-TLV-wrapped bytes verbatim. Takes ownership of tlv
+ * regardless of outcome. */
+static void start_type2_write(struct nfcd_client *client, GByteArray *tlv,
+                              nfcd_result_cb cb, void *user_data)
+{
+	struct write_req *req;
+
+	req = g_new0(struct write_req, 1);
+	req->client = client;
+	req->tlv = tlv;
+	req->cb = cb;
+	req->user_data = user_data;
+
+	nfcd_interface_tag_proxy_new_for_bus(G_BUS_TYPE_SYSTEM, G_DBUS_PROXY_FLAGS_NONE,
+	                                     NFCD_DAEMON_SERVICE, client->tag_path,
+	                                     client->cancellable,
+	                                     write_tag_proxy_ready, req);
+}
+
 void nfcd_client_write_tag(struct nfcd_client *client, GByteArray *message,
                            nfcd_result_cb cb, void *user_data)
 {
-	struct write_req *req;
 	GByteArray *tlv;
 
 	if (!client->tag_path) {
@@ -1210,16 +1744,236 @@ void nfcd_client_write_tag(struct nfcd_client *client, GByteArray *message,
 		return;
 	}
 
-	req = g_new0(struct write_req, 1);
+	start_type2_write(client, tlv, cb, user_data);
+}
+
+void nfcd_client_write_raw(struct nfcd_client *client, const GByteArray *raw_data,
+                           nfcd_result_cb cb, void *user_data)
+{
+	GByteArray *copy;
+
+	if (!client->tag_path) {
+		cb(FALSE, "No tag in the field", user_data);
+		return;
+	}
+
+	if (!client->tag_is_type2) {
+		cb(FALSE, "Only Type 2 tags can be written", user_data);
+		return;
+	}
+
+	if (!raw_data || raw_data->len == 0) {
+		cb(FALSE, "Nothing to write", user_data);
+		return;
+	}
+
+	/* start_type2_write takes ownership; the caller still owns raw_data */
+	copy = g_byte_array_sized_new(raw_data->len);
+	g_byte_array_append(copy, raw_data->data, raw_data->len);
+
+	start_type2_write(client, copy, cb, user_data);
+}
+
+/*
+ * Locking a tag permanently, by setting the NFC Forum Type 2 static lock
+ * bits in block 2 (bytes 2-3). This is the layout shared by the NTAG21x /
+ * MIFARE Ultralight family, which covers the overwhelming majority of
+ * writable tags people actually own; the dynamic lock area some larger tags
+ * (NTAG216 and up) additionally have past their first ~48 bytes isn't
+ * touched, so a very large tag may still have some writable pages after
+ * this. There is no way back from this once it reaches the tag.
+ */
+
+struct lock_req {
+	struct nfcd_client *client;
+	NfcdInterfaceTag *tag;
+	NfcdInterfaceTagType2 *type2;
+	nfcd_result_cb cb;
+	void *user_data;
+	gchar *error_text;
+};
+
+static void lock_req_finish(struct lock_req *req, gboolean success, const char *error_text)
+{
+	req->cb(success, error_text, req->user_data);
+
+	if (req->type2)
+		g_object_unref(req->type2);
+
+	if (req->tag)
+		g_object_unref(req->tag);
+
+	g_free(req->error_text);
+	g_free(req);
+}
+
+static void lock_release_ready(GObject *source, GAsyncResult *res, gpointer user_data)
+{
+	struct lock_req *req = user_data;
+	NfcdInterfaceTag *tag = NFCD_INTERFACE_TAG(source);
+	GError *error = NULL;
+
+	if (!nfcd_interface_tag_call_release_finish(tag, res, &error)) {
+		g_warning("Failed to release tag after locking: %s", error->message);
+		g_error_free(error);
+	}
+
+	lock_req_finish(req, !req->error_text, req->error_text);
+}
+
+static void lock_release(struct lock_req *req)
+{
+	nfcd_interface_tag_call_release(req->tag, req->client->cancellable,
+	                                lock_release_ready, req);
+}
+
+static void lock_write_ready(GObject *source, GAsyncResult *res, gpointer user_data)
+{
+	struct lock_req *req = user_data;
+	NfcdInterfaceTagType2 *type2 = NFCD_INTERFACE_TAG_TYPE2(source);
+	GError *error = NULL;
+	guint written = 0;
+
+	if (!nfcd_interface_tag_type2_call_write_finish(type2, &written, res, &error)) {
+		req->error_text = g_strdup_printf("Failed to write the lock bytes: %s",
+		                                  error->message);
+		g_error_free(error);
+	} else if (written != 4) {
+		req->error_text = g_strdup_printf("Short write of the lock block: %u of 4 bytes",
+		                                  written);
+	}
+
+	lock_release(req);
+}
+
+static void lock_read_ready(GObject *source, GAsyncResult *res, gpointer user_data)
+{
+	struct lock_req *req = user_data;
+	NfcdInterfaceTagType2 *type2 = NFCD_INTERFACE_TAG_TYPE2(source);
+	GError *error = NULL;
+	GVariant *data = NULL;
+
+	if (!nfcd_interface_tag_type2_call_read_finish(type2, &data, res, &error)) {
+		req->error_text = g_strdup_printf("Failed to read the lock block: %s",
+		                                  error->message);
+		g_error_free(error);
+		lock_release(req);
+		return;
+	}
+
+	{
+		gsize len = 0;
+		const guint8 *block = g_variant_get_fixed_array(data, &len, 1);
+		guint8 new_block[4];
+		GVariant *new_data;
+
+		if (len != 4) {
+			req->error_text = g_strdup_printf("Unexpected lock block size: %zu bytes", len);
+			g_variant_unref(data);
+			lock_release(req);
+			return;
+		}
+
+		/* Bytes 0-1 (BCC1, Internal) are preserved; 2-3 are the lock bytes.
+		 * All-ones locks every static-locking-covered page, including these
+		 * lock bytes themselves. */
+		new_block[0] = block[0];
+		new_block[1] = block[1];
+		new_block[2] = 0xff;
+		new_block[3] = 0xff;
+
+		g_variant_unref(data);
+
+		new_data = g_variant_new_fixed_array(G_VARIANT_TYPE_BYTE, new_block, 4, 1);
+		nfcd_interface_tag_type2_call_write(req->type2, 0, 2, new_data,
+		                                    req->client->cancellable,
+		                                    lock_write_ready, req);
+	}
+}
+
+static void lock_type2_proxy_ready(GObject *source, GAsyncResult *res, gpointer user_data)
+{
+	struct lock_req *req = user_data;
+	GError *error = NULL;
+
+	req->type2 = nfcd_interface_tag_type2_proxy_new_for_bus_finish(res, &error);
+
+	if (!req->type2) {
+		req->error_text = g_strdup_printf("Failed to reach the tag: %s", error->message);
+		g_error_free(error);
+		lock_release(req);
+		return;
+	}
+
+	nfcd_interface_tag_type2_call_read(req->type2, 0, 2, req->client->cancellable,
+	                                   lock_read_ready, req);
+}
+
+static void lock_acquire_ready(GObject *source, GAsyncResult *res, gpointer user_data)
+{
+	struct lock_req *req = user_data;
+	NfcdInterfaceTag *tag = NFCD_INTERFACE_TAG(source);
+	GError *error = NULL;
+
+	if (!nfcd_interface_tag_call_acquire_finish(tag, res, &error)) {
+		gchar *text = g_strdup_printf("Failed to acquire the tag: %s", error->message);
+
+		g_error_free(error);
+		lock_req_finish(req, FALSE, text);
+		g_free(text);
+		return;
+	}
+
+	nfcd_interface_tag_type2_proxy_new_for_bus(G_BUS_TYPE_SYSTEM, G_DBUS_PROXY_FLAGS_NONE,
+	                                           NFCD_DAEMON_SERVICE,
+	                                           req->client->tag_path,
+	                                           req->client->cancellable,
+	                                           lock_type2_proxy_ready, req);
+}
+
+static void lock_tag_proxy_ready(GObject *source, GAsyncResult *res, gpointer user_data)
+{
+	struct lock_req *req = user_data;
+	GError *error = NULL;
+
+	req->tag = nfcd_interface_tag_proxy_new_for_bus_finish(res, &error);
+
+	if (!req->tag) {
+		gchar *text = g_strdup_printf("Failed to reach the tag: %s", error->message);
+
+		g_error_free(error);
+		lock_req_finish(req, FALSE, text);
+		g_free(text);
+		return;
+	}
+
+	nfcd_interface_tag_call_acquire(req->tag, FALSE, req->client->cancellable,
+	                                lock_acquire_ready, req);
+}
+
+void nfcd_client_lock_tag(struct nfcd_client *client, nfcd_result_cb cb, void *user_data)
+{
+	struct lock_req *req;
+
+	if (!client->tag_path) {
+		cb(FALSE, "No tag in the field", user_data);
+		return;
+	}
+
+	if (!client->tag_is_type2) {
+		cb(FALSE, "Only Type 2 tags can be locked", user_data);
+		return;
+	}
+
+	req = g_new0(struct lock_req, 1);
 	req->client = client;
-	req->tlv = tlv;
 	req->cb = cb;
 	req->user_data = user_data;
 
 	nfcd_interface_tag_proxy_new_for_bus(G_BUS_TYPE_SYSTEM, G_DBUS_PROXY_FLAGS_NONE,
 	                                     NFCD_DAEMON_SERVICE, client->tag_path,
 	                                     client->cancellable,
-	                                     write_tag_proxy_ready, req);
+	                                     lock_tag_proxy_ready, req);
 }
 
 // vim:ts=4:sw=4:noexpandtab

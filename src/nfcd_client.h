@@ -79,6 +79,22 @@ void nfcd_client_set_enabled(struct nfcd_client *client, gboolean enabled,
 void nfcd_client_write_tag(struct nfcd_client *client, GByteArray *message,
                            nfcd_result_cb cb, void *user_data);
 
+/**
+ * Writes an already-Type-2-TLV-wrapped byte blob to the tag currently in the
+ * field verbatim, with no NDEF re-encoding. This is what cloneTag uses to
+ * replay a source tag's "rawDataHex" byte for byte. Takes ownership of
+ * nothing: the caller still owns raw_data.
+ */
+void nfcd_client_write_raw(struct nfcd_client *client, const GByteArray *raw_data,
+                           nfcd_result_cb cb, void *user_data);
+
+/**
+ * Permanently write-protects the Type 2 tag currently in the field by
+ * setting its static lock bits. Irreversible - see the comment above the
+ * implementation for exactly what this does and doesn't cover.
+ */
+void nfcd_client_lock_tag(struct nfcd_client *client, nfcd_result_cb cb, void *user_data);
+
 #endif
 
 // vim:ts=4:sw=4:noexpandtab
