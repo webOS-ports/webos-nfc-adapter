@@ -188,6 +188,11 @@ struct passport_read {
 
 	GByteArray *dg1;		/* accumulated EF.DG1 bytes */
 	gsize dg1_total_len;		/* from the first 4 bytes' TLV header */
+	gchar *mrz;			/* set once DG1 is parsed, kept for the DG2 leg */
+
+	gboolean read_photo;
+	GByteArray *dg2;		/* accumulated EF.DG2 bytes, best-effort */
+	gsize dg2_total_len;
 
 	nfcd_passport_cb cb;
 	void *user_data;
@@ -231,6 +236,11 @@ static void passport_get_challenge_ready(GObject *source, GAsyncResult *res, gpo
 static void passport_mutual_auth_ready(GObject *source, GAsyncResult *res, gpointer user_data);
 static void passport_select_dg1_ready(GObject *source, GAsyncResult *res, gpointer user_data);
 static void passport_dg1_rest_ready(GObject *source, GAsyncResult *res, gpointer user_data);
+static void passport_build_result_and_finish(struct passport_read *read);
+static void passport_select_dg2_start(struct passport_read *read);
+static void passport_select_dg2_ready(GObject *source, GAsyncResult *res, gpointer user_data);
+static void passport_dg2_rest_ready(GObject *source, GAsyncResult *res, gpointer user_data);
+static void passport_dg2_read_more(struct passport_read *read);
 
 static void passport_select_ef_cardaccess_ready(GObject *source, GAsyncResult *res,
                                                 gpointer user_data);
@@ -1092,6 +1102,10 @@ static void tag_read_start(struct nfcd_client *client, const char *path)
 #define PASSPORT_EMRTD_FID_LO	0x01
 #define PASSPORT_DG1_MAX_LEN	2048	/* generous sanity ceiling, not a real limit */
 
+#define PASSPORT_DG2_FID_HI	0x01
+#define PASSPORT_DG2_FID_LO	0x02
+#define PASSPORT_DG2_MAX_LEN	65536	/* photos run tens of KB; still just a ceiling */
+
 /* Same AID bac_build_select_aid() sends in the clear for BAC - PACE needs
  * its own copy since this one goes out under secure messaging instead,
  * after PACE's handshake (see pace_mutual_auth_ready()). */
@@ -1117,6 +1131,10 @@ static void passport_read_free(struct passport_read *read)
 
 	if (read->dg1)
 		g_byte_array_free(read->dg1, TRUE);
+	g_free(read->mrz);
+
+	if (read->dg2)
+		g_byte_array_free(read->dg2, TRUE);
 
 	if (read->pace_k)
 		g_byte_array_free(read->pace_k, TRUE);
@@ -1134,9 +1152,12 @@ static void passport_read_free(struct passport_read *read)
 }
 
 /* The only place that invokes the caller's callback - every step below
- * ends here exactly once, success or failure. */
+ * ends here exactly once, success or failure. On success, result's
+ * pointers must stay valid across this call but are owned by the caller
+ * (passport_build_result_and_finish()), not by read - passport_read_free()
+ * above runs before cb() does. */
 static void passport_read_finish(struct passport_read *read, gboolean success,
-                                 const char *error_text, const char *mrz_text)
+                                 const char *error_text, const PassportResult *result)
 {
 	nfcd_passport_cb cb = read->cb;
 	void *user_data = read->user_data;
@@ -1147,7 +1168,45 @@ static void passport_read_finish(struct passport_read *read, gboolean success,
 	passport_read_free(read);
 
 	if (cb)
-		cb(success, error_text, mrz_text, user_data);
+		cb(success, error_text, result, user_data);
+}
+
+/* Builds the PassportResult (parsed MRZ fields, and the photo if DG2 was
+ * read) and finishes. Takes ownership of read->mrz/read->dg2 itself so
+ * passport_read_free() (called inside passport_read_finish(), before cb()
+ * runs) doesn't free them out from under the result. */
+static void passport_build_result_and_finish(struct passport_read *read)
+{
+	gchar *mrz = read->mrz;
+	GByteArray *dg2 = read->dg2;
+	MrzFields fields;
+	gboolean have_fields;
+	const gchar *photo_format = NULL;
+	GByteArray *photo = NULL;
+	PassportResult result = { 0 };
+
+	read->mrz = NULL;
+	read->dg2 = NULL;
+
+	have_fields = bac_parse_mrz_fields(mrz, &fields);
+	if (dg2) {
+		photo = bac_extract_dg2_photo(dg2->data, dg2->len, &photo_format);
+		g_byte_array_free(dg2, TRUE);
+	}
+
+	result.mrz_text = mrz;
+	result.fields = have_fields ? &fields : NULL;
+	if (photo) {
+		result.photo = photo->data;
+		result.photo_len = photo->len;
+		result.photo_format = photo_format;
+	}
+
+	passport_read_finish(read, TRUE, NULL, &result);
+
+	g_free(mrz);
+	if (photo)
+		g_byte_array_free(photo, TRUE);
 }
 
 /* Detaches from a client that's going away (torn down, or the tag in the
@@ -1898,8 +1957,12 @@ static void passport_dg1_read_more(struct passport_read *read)
 				"Could not parse the MRZ data group (EF.DG1)", NULL);
 			return;
 		}
-		passport_read_finish(read, TRUE, NULL, mrz);
-		g_free(mrz);
+		read->mrz = mrz;
+		if (read->read_photo) {
+			passport_select_dg2_start(read);
+			return;
+		}
+		passport_build_result_and_finish(read);
 		return;
 	}
 
@@ -1916,6 +1979,139 @@ static void passport_dg1_read_more(struct passport_read *read)
 		return;
 	}
 	passport_transceive(read, apdu, passport_dg1_rest_ready);
+}
+
+/* ---- EF.DG2 (facial photo): same SELECT-by-FID + chunked READ BINARY
+ * shape as DG1 above, but best-effort throughout - any failure here just
+ * falls back to the MRZ-only result instead of failing the whole read,
+ * since the photo is an add-on, not what BAC/PACE actually proves. ---- */
+
+static void passport_select_dg2_start(struct passport_read *read)
+{
+	guint8 fid[2] = { PASSPORT_DG2_FID_HI, PASSPORT_DG2_FID_LO };
+	GByteArray *apdu = read->use_pace ?
+	      pace_sm_protect(&read->pace_session, 0x00, 0xA4, 0x02, 0x0C, fid, sizeof(fid), -1) :
+	      bac_sm_protect(&read->session, 0x00, 0xA4, 0x02, 0x0C, fid, sizeof(fid), -1);
+
+	if (!apdu) {
+		passport_build_result_and_finish(read);
+		return;
+	}
+	passport_transceive(read, apdu, passport_select_dg2_ready);
+}
+
+static void passport_select_dg2_ready(GObject *source, GAsyncResult *res, gpointer user_data)
+{
+	struct passport_read *read = user_data;
+	GError *error = NULL;
+	GVariant *response = NULL;
+	gboolean ok;
+	GByteArray *plaintext = NULL;
+	const char *error_text = NULL;
+	GByteArray *apdu;
+
+	ok = nfcd_interface_tag_call_transceive_finish(NFCD_INTERFACE_TAG(source),
+	                                               &response, res, &error);
+	if (!ok) {
+		if (error)
+			g_error_free(error);
+		passport_build_result_and_finish(read);
+		return;
+	}
+
+	ok = passport_sm_response_ok(read, response, &plaintext, &error_text);
+	g_variant_unref(response);
+	if (plaintext)
+		g_byte_array_free(plaintext, TRUE);
+
+	if (!ok) {
+		passport_build_result_and_finish(read);
+		return;
+	}
+
+	read->dg2 = g_byte_array_new();
+	apdu = read->use_pace ?
+	      pace_sm_protect(&read->pace_session, 0x00, 0xB0, 0x00, 0x00, NULL, 0, 4) :
+	      bac_sm_protect(&read->session, 0x00, 0xB0, 0x00, 0x00, NULL, 0, 4);
+	if (!apdu) {
+		passport_build_result_and_finish(read);
+		return;
+	}
+	passport_transceive(read, apdu, passport_dg2_rest_ready);
+}
+
+static void passport_dg2_rest_ready(GObject *source, GAsyncResult *res, gpointer user_data)
+{
+	struct passport_read *read = user_data;
+	GError *error = NULL;
+	GVariant *response = NULL;
+	gboolean ok;
+	GByteArray *plaintext = NULL;
+	const char *error_text = NULL;
+
+	ok = nfcd_interface_tag_call_transceive_finish(NFCD_INTERFACE_TAG(source),
+	                                               &response, res, &error);
+	if (!ok) {
+		if (error)
+			g_error_free(error);
+		passport_build_result_and_finish(read);
+		return;
+	}
+
+	ok = passport_sm_response_ok(read, response, &plaintext, &error_text);
+	g_variant_unref(response);
+
+	if (!ok || !plaintext) {
+		if (plaintext)
+			g_byte_array_free(plaintext, TRUE);
+		passport_build_result_and_finish(read);
+		return;
+	}
+
+	g_byte_array_append(read->dg2, plaintext->data, plaintext->len);
+	g_byte_array_free(plaintext, TRUE);
+
+	if (read->dg2_total_len == 0) {
+		gsize header_len, content_len;
+
+		if (!bac_ber_tlv_header(read->dg2->data, read->dg2->len, &header_len, &content_len) ||
+		    header_len + content_len > PASSPORT_DG2_MAX_LEN) {
+			/* Can't tell how much more to read - stop here rather than
+			 * loop on a bogus length. */
+			passport_build_result_and_finish(read);
+			return;
+		}
+		read->dg2_total_len = header_len + content_len;
+	}
+
+	passport_dg2_read_more(read);
+}
+
+static void passport_dg2_read_more(struct passport_read *read)
+{
+	gsize remaining = read->dg2_total_len - read->dg2->len;
+	gsize chunk;
+	guint offset;
+	GByteArray *apdu;
+
+	if (remaining == 0) {
+		passport_build_result_and_finish(read);
+		return;
+	}
+
+	chunk = MIN(remaining, 255);
+	offset = (guint) read->dg2->len;
+
+	apdu = read->use_pace ?
+	      pace_sm_protect(&read->pace_session, 0x00, 0xB0, (guint8)(offset >> 8),
+	                      (guint8)(offset & 0xFF), NULL, 0, (gint) chunk) :
+	      bac_sm_protect(&read->session, 0x00, 0xB0, (guint8)(offset >> 8),
+	                      (guint8)(offset & 0xFF), NULL, 0, (gint) chunk);
+	if (!apdu) {
+		passport_build_result_and_finish(read);
+		return;
+	}
+	passport_transceive(read, apdu, passport_dg2_rest_ready);
 }
 
 /* Common preconditions for either a BAC or a PACE read: one at a time, a
@@ -1957,7 +2153,7 @@ static void passport_read_dispatch(struct nfcd_client *client, struct passport_r
 
 void nfcd_client_read_passport(struct nfcd_client *client, const char *document_number,
                                const char *date_of_birth, const char *date_of_expiry,
-                               nfcd_passport_cb cb, void *user_data)
+                               gboolean read_photo, nfcd_passport_cb cb, void *user_data)
 {
 	struct passport_read *read;
 	BacStaticKeys keys;
@@ -1973,11 +2169,12 @@ void nfcd_client_read_passport(struct nfcd_client *client, const char *document_
 
 	read = g_new0(struct passport_read, 1);
 	read->keys = keys;
+	read->read_photo = read_photo;
 	passport_read_dispatch(client, read, cb, user_data);
 }
 
 void nfcd_client_read_passport_pace(struct nfcd_client *client, const char *can,
-                                    nfcd_passport_cb cb, void *user_data)
+                                    gboolean read_photo, nfcd_passport_cb cb, void *user_data)
 {
 	struct passport_read *read;
 	GByteArray *k;
@@ -1998,6 +2195,7 @@ void nfcd_client_read_passport_pace(struct nfcd_client *client, const char *can,
 	read = g_new0(struct passport_read, 1);
 	read->use_pace = TRUE;
 	read->pace_k = k;
+	read->read_photo = read_photo;
 	passport_read_dispatch(client, read, cb, user_data);
 }
 

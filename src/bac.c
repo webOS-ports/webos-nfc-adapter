@@ -471,6 +471,163 @@ gchar *bac_parse_dg1_mrz(const guint8 *dg1, gsize dg1_len)
 	return g_strndup((const gchar *) dg1 + pos, inner_content);
 }
 
+/* ---- MRZ field parsing ---- */
+
+/* Copies up to len bytes from src, stopping at the first '<' fill
+ * character or out_cap-1, whichever comes first - every fixed-width MRZ
+ * field except the name is right-padded with '<', never contains one. */
+static void mrz_trim_copy(const gchar *src, gsize len, gchar *out, gsize out_cap)
+{
+	gsize n = 0;
+
+	while (n < len && n + 1 < out_cap && src[n] != '<')
+		n++;
+	memcpy(out, src, n);
+	out[n] = '\0';
+}
+
+/* Name field: primary identifier (surname), then "<<", then secondary
+ * identifier (given names) - single '<' within either part is a space.
+ * No "<<" at all means no secondary identifier was present. */
+static void mrz_decode_name(const gchar *field, gsize len, gchar *surname_out, gsize surname_cap,
+                            gchar *given_out, gsize given_cap)
+{
+	gsize sep = 0, n;
+
+	while (sep + 1 < len && !(field[sep] == '<' && field[sep + 1] == '<'))
+		sep++;
+	if (sep + 1 >= len)
+		sep = len;
+
+	n = MIN(sep, surname_cap - 1);
+	for (gsize i = 0; i < n; i++)
+		surname_out[i] = (field[i] == '<') ? ' ' : field[i];
+	surname_out[n] = '\0';
+	g_strchomp(surname_out);
+
+	given_out[0] = '\0';
+	if (sep + 2 < len) {
+		gsize glen = MIN(len - (sep + 2), given_cap - 1);
+
+		for (gsize i = 0; i < glen; i++)
+			given_out[i] = (field[sep + 2 + i] == '<') ? ' ' : field[sep + 2 + i];
+		given_out[glen] = '\0';
+		g_strchomp(given_out);
+	}
+}
+
+#define MRZ_TD1_LEN	90
+#define MRZ_TD3_LEN	88
+
+gboolean bac_parse_mrz_fields(const gchar *mrz, MrzFields *out)
+{
+	gsize len;
+	char digit;
+
+	if (!mrz || !out)
+		return FALSE;
+
+	len = strlen(mrz);
+	memset(out, 0, sizeof(*out));
+
+	if (len == MRZ_TD1_LEN) {
+		/* Line 1 [0-29]: type(2) state(3) docnum(9) check(1) optional(15)
+		 * Line 2 [30-59]: dob(6) check(1) sex(1) expiry(6) check(1)
+		 *                 nationality(3) optional(11) composite(1)
+		 * Line 3 [60-89]: name(30) */
+		mrz_trim_copy(mrz, 2, out->document_type, sizeof(out->document_type));
+		mrz_trim_copy(mrz + 2, 3, out->issuing_state, sizeof(out->issuing_state));
+		mrz_trim_copy(mrz + 5, 9, out->document_number, sizeof(out->document_number));
+		out->document_number_check_ok = mrz_check_digit(mrz + 5, 9, &digit) &&
+		                                digit == mrz[14];
+
+		mrz_trim_copy(mrz + 30, 6, out->date_of_birth, sizeof(out->date_of_birth));
+		out->date_of_birth_check_ok = mrz_check_digit(mrz + 30, 6, &digit) &&
+		                              digit == mrz[36];
+		out->sex[0] = mrz[37];
+		mrz_trim_copy(mrz + 38, 6, out->date_of_expiry, sizeof(out->date_of_expiry));
+		out->date_of_expiry_check_ok = mrz_check_digit(mrz + 38, 6, &digit) &&
+		                               digit == mrz[44];
+		mrz_trim_copy(mrz + 45, 3, out->nationality, sizeof(out->nationality));
+
+		mrz_decode_name(mrz + 60, 30, out->surname, sizeof(out->surname),
+		                out->given_names, sizeof(out->given_names));
+		return TRUE;
+	}
+
+	if (len == MRZ_TD3_LEN) {
+		/* Line 1 [0-43]: type(2) state(3) name(39)
+		 * Line 2 [44-87]: docnum(9) check(1) nationality(3) dob(6) check(1)
+		 *                 sex(1) expiry(6) check(1) optional(14)
+		 *                 optcheck(1) composite(1) */
+		mrz_trim_copy(mrz, 2, out->document_type, sizeof(out->document_type));
+		mrz_trim_copy(mrz + 2, 3, out->issuing_state, sizeof(out->issuing_state));
+		mrz_decode_name(mrz + 5, 39, out->surname, sizeof(out->surname),
+		                out->given_names, sizeof(out->given_names));
+
+		mrz_trim_copy(mrz + 44, 9, out->document_number, sizeof(out->document_number));
+		out->document_number_check_ok = mrz_check_digit(mrz + 44, 9, &digit) &&
+		                                digit == mrz[53];
+		mrz_trim_copy(mrz + 54, 3, out->nationality, sizeof(out->nationality));
+		mrz_trim_copy(mrz + 57, 6, out->date_of_birth, sizeof(out->date_of_birth));
+		out->date_of_birth_check_ok = mrz_check_digit(mrz + 57, 6, &digit) &&
+		                              digit == mrz[63];
+		out->sex[0] = mrz[64];
+		mrz_trim_copy(mrz + 65, 6, out->date_of_expiry, sizeof(out->date_of_expiry));
+		out->date_of_expiry_check_ok = mrz_check_digit(mrz + 65, 6, &digit) &&
+		                               digit == mrz[71];
+		return TRUE;
+	}
+
+	return FALSE;
+}
+
+/* ---- DG2 (facial photo) ---- */
+
+static const guint8 jpeg_magic[] = { 0xFF, 0xD8, 0xFF };
+static const guint8 jp2_magic[] = { 0x00, 0x00, 0x00, 0x0C, 0x6A, 0x50, 0x20, 0x20, 0x0D, 0x0A,
+                                   0x87, 0x0A };
+static const guint8 jp2_codestream_magic[] = { 0xFF, 0x4F, 0xFF, 0x51 };
+
+static gssize find_bytes(const guint8 *haystack, gsize haystack_len,
+                         const guint8 *needle, gsize needle_len)
+{
+	if (needle_len == 0 || haystack_len < needle_len)
+		return -1;
+
+	for (gsize n = 0; n <= haystack_len - needle_len; n++)
+		if (memcmp(haystack + n, needle, needle_len) == 0)
+			return (gssize) n;
+	return -1;
+}
+
+GByteArray *bac_extract_dg2_photo(const guint8 *dg2, gsize dg2_len, const gchar **format_out)
+{
+	gssize pos;
+	const gchar *format;
+	GByteArray *photo;
+
+	pos = find_bytes(dg2, dg2_len, jpeg_magic, sizeof(jpeg_magic));
+	format = "jpeg";
+
+	if (pos < 0) {
+		pos = find_bytes(dg2, dg2_len, jp2_magic, sizeof(jp2_magic));
+		format = "jpeg2000";
+	}
+	if (pos < 0) {
+		pos = find_bytes(dg2, dg2_len, jp2_codestream_magic, sizeof(jp2_codestream_magic));
+		format = "jpeg2000";
+	}
+	if (pos < 0)
+		return NULL;
+
+	photo = g_byte_array_new();
+	g_byte_array_append(photo, dg2 + pos, (guint)(dg2_len - (gsize) pos));
+	if (format_out)
+		*format_out = format;
+	return photo;
+}
+
 /* ---- Secure messaging ---- */
 
 static void ssc_increment(guint8 ssc[BAC_SSC_LEN])

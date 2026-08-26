@@ -25,6 +25,7 @@
 #include "nfcd_client.h"
 #include "luna_service_utils.h"
 #include "ndef.h"
+#include "bac.h"
 
 #define NFC_SERVICE_NAME	"com.webos.service.nfc"
 
@@ -280,6 +281,20 @@ static gchar *get_string_param(jvalue_ref parsed_obj, const char *name)
 	buf = jstring_get_fast(value_obj);
 
 	return g_strndup(buf.m_str, buf.m_len);
+}
+
+/* Pulls a bool field out of the request, defaulting to FALSE if absent or
+ * not a bool - same convention as the "implicit" param on addCardEmulationProfile. */
+static gboolean get_bool_param(jvalue_ref parsed_obj, const char *name)
+{
+	jvalue_ref value_obj = NULL;
+	bool value = false;
+
+	if (jobject_get_exists(parsed_obj, j_cstr_to_buffer(name), &value_obj) &&
+	    jis_boolean(value_obj))
+		jboolean_get(value_obj, &value);
+
+	return value ? TRUE : FALSE;
 }
 
 static bool _service_write_tag_cb(LSHandle *handle, LSMessage *message, void *user_data)
@@ -593,15 +608,47 @@ static bool _service_get_card_emulation_event_cb(LSHandle *handle, LSMessage *me
 }
 
 static void read_passport_result_cb(gboolean success, const char *error_text,
-                                    const char *mrz_text, void *user_data)
+                                    const PassportResult *result, void *user_data)
 {
 	struct nfc_request *req = user_data;
 
 	if (success) {
 		jvalue_ref reply_obj = jobject_create();
+		const MrzFields *f = result->fields;
 
 		jobject_put(reply_obj, J_CSTR_TO_JVAL("returnValue"), jboolean_create(true));
-		jobject_put(reply_obj, J_CSTR_TO_JVAL("mrz"), jstring_create(mrz_text));
+		jobject_put(reply_obj, J_CSTR_TO_JVAL("mrz"), jstring_create(result->mrz_text));
+
+		/* f is NULL if the MRZ didn't parse as a recognized TD1/TD3 layout -
+		 * mrz above still has the raw text either way. */
+		if (f) {
+			jobject_put(reply_obj, J_CSTR_TO_JVAL("documentType"),
+			           jstring_create(f->document_type));
+			jobject_put(reply_obj, J_CSTR_TO_JVAL("issuingState"),
+			           jstring_create(f->issuing_state));
+			jobject_put(reply_obj, J_CSTR_TO_JVAL("surname"), jstring_create(f->surname));
+			jobject_put(reply_obj, J_CSTR_TO_JVAL("givenNames"),
+			           jstring_create(f->given_names));
+			jobject_put(reply_obj, J_CSTR_TO_JVAL("documentNumber"),
+			           jstring_create(f->document_number));
+			jobject_put(reply_obj, J_CSTR_TO_JVAL("nationality"),
+			           jstring_create(f->nationality));
+			jobject_put(reply_obj, J_CSTR_TO_JVAL("dateOfBirth"),
+			           jstring_create(f->date_of_birth));
+			jobject_put(reply_obj, J_CSTR_TO_JVAL("sex"), jstring_create(f->sex));
+			jobject_put(reply_obj, J_CSTR_TO_JVAL("dateOfExpiry"),
+			           jstring_create(f->date_of_expiry));
+		}
+
+		if (result->photo) {
+			gchar *photo_b64 = g_base64_encode(result->photo, result->photo_len);
+
+			jobject_put(reply_obj, J_CSTR_TO_JVAL("photoBase64"), jstring_create(photo_b64));
+			jobject_put(reply_obj, J_CSTR_TO_JVAL("photoFormat"),
+			           jstring_create(result->photo_format));
+			g_free(photo_b64);
+		}
+
 		luna_service_message_validate_and_send(req->handle, req->message, reply_obj);
 		j_release(&reply_obj);
 	} else {
@@ -617,6 +664,7 @@ static bool _service_read_passport_cb(LSHandle *handle, LSMessage *message, void
 	struct nfc_service *service = user_data;
 	jvalue_ref parsed_obj = NULL;
 	gchar *document_number = NULL, *date_of_birth = NULL, *date_of_expiry = NULL;
+	gboolean read_photo;
 
 	parsed_obj = luna_service_message_parse_and_validate(LSMessageGetPayload(message));
 	if (!parsed_obj) {
@@ -628,11 +676,13 @@ static bool _service_read_passport_cb(LSHandle *handle, LSMessage *message, void
 	 * The same three fields printed in the document's own MRZ - proof
 	 * the caller already holds the physical document, which is what BAC
 	 * itself relies on. Dates are YYMMDD; check digits are computed
-	 * here, not expected from the caller.
+	 * here, not expected from the caller. readPhoto also fetches DG2
+	 * (the facial photo) - opt-in since it costs extra round trips.
 	 */
 	document_number = get_string_param(parsed_obj, "documentNumber");
 	date_of_birth = get_string_param(parsed_obj, "dateOfBirth");
 	date_of_expiry = get_string_param(parsed_obj, "dateOfExpiry");
+	read_photo = get_bool_param(parsed_obj, "readPhoto");
 
 	j_release(&parsed_obj);
 
@@ -647,7 +697,8 @@ static bool _service_read_passport_cb(LSHandle *handle, LSMessage *message, void
 	}
 
 	nfcd_client_read_passport(service->client, document_number, date_of_birth, date_of_expiry,
-	                          read_passport_result_cb, nfc_request_new(handle, message));
+	                          read_photo, read_passport_result_cb,
+	                          nfc_request_new(handle, message));
 
 	g_free(document_number);
 	g_free(date_of_birth);
@@ -669,6 +720,7 @@ static bool _service_read_passport_pace_cb(LSHandle *handle, LSMessage *message,
 	struct nfc_service *service = user_data;
 	jvalue_ref parsed_obj = NULL;
 	gchar *can = NULL;
+	gboolean read_photo;
 
 	parsed_obj = luna_service_message_parse_and_validate(LSMessageGetPayload(message));
 	if (!parsed_obj) {
@@ -677,6 +729,7 @@ static bool _service_read_passport_pace_cb(LSHandle *handle, LSMessage *message,
 	}
 
 	can = get_string_param(parsed_obj, "can");
+	read_photo = get_bool_param(parsed_obj, "readPhoto");
 	j_release(&parsed_obj);
 
 	if (!can) {
@@ -685,7 +738,7 @@ static bool _service_read_passport_pace_cb(LSHandle *handle, LSMessage *message,
 		return true;
 	}
 
-	nfcd_client_read_passport_pace(service->client, can,
+	nfcd_client_read_passport_pace(service->client, can, read_photo,
 	                               read_passport_result_cb, nfc_request_new(handle, message));
 
 	g_free(can);
