@@ -50,6 +50,10 @@ typedef void (*nfcd_hce_cb)(struct nfcd_client *client, void *user_data);
 /* Completion of a request that can fail */
 typedef void (*nfcd_result_cb)(gboolean success, const char *error_text, void *user_data);
 
+/* Completion of a passport/eID BAC read - mrz_text is NULL on failure */
+typedef void (*nfcd_passport_cb)(gboolean success, const char *error_text,
+                                 const char *mrz_text, void *user_data);
+
 struct nfcd_client *nfcd_client_create(nfcd_state_cb state_cb, nfcd_tag_cb tag_cb,
                                        nfcd_hce_cb hce_cb, void *user_data);
 void nfcd_client_free(struct nfcd_client *client);
@@ -128,6 +132,22 @@ void nfcd_client_remove_card_emulation_profile(struct nfcd_client *client,
 /* Unregisters every profile added via nfcd_client_add_card_emulation_profile() */
 void nfcd_client_clear_card_emulation(struct nfcd_client *client,
                                       nfcd_result_cb cb, void *user_data);
+
+/**
+ * Reads the tag currently in the field as an ICAO 9303 eMRTD chip (passport
+ * or eID) using Basic Access Control: derives the chip access keys from
+ * document_number/date_of_birth/date_of_expiry (the same three fields
+ * printed in the document's own MRZ - dates as YYMMDD, check digits
+ * computed here), runs the BAC handshake, and reads EF.DG1 (the chip's own
+ * copy of the MRZ) under secure messaging as proof the handshake worked.
+ * Only usable by whoever can already read the document's printed MRZ -
+ * that is what BAC itself requires. Fails cleanly (not a crash or hang) if
+ * the tag isn't ISO-DEP, the MRZ data is wrong, or the document needs PACE
+ * instead of BAC (common on newer EU documents).
+ */
+void nfcd_client_read_passport(struct nfcd_client *client, const char *document_number,
+                               const char *date_of_birth, const char *date_of_expiry,
+                               nfcd_passport_cb cb, void *user_data);
 
 /**
  * The most recent reader-confirmed card-emulation exchange: which AID was

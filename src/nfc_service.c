@@ -592,6 +592,70 @@ static bool _service_get_card_emulation_event_cb(LSHandle *handle, LSMessage *me
 	return true;
 }
 
+static void read_passport_result_cb(gboolean success, const char *error_text,
+                                    const char *mrz_text, void *user_data)
+{
+	struct nfc_request *req = user_data;
+
+	if (success) {
+		jvalue_ref reply_obj = jobject_create();
+
+		jobject_put(reply_obj, J_CSTR_TO_JVAL("returnValue"), jboolean_create(true));
+		jobject_put(reply_obj, J_CSTR_TO_JVAL("mrz"), jstring_create(mrz_text));
+		luna_service_message_validate_and_send(req->handle, req->message, reply_obj);
+		j_release(&reply_obj);
+	} else {
+		luna_service_message_reply_custom_error(req->handle, req->message,
+			error_text ? error_text : "Failed to read the document");
+	}
+
+	nfc_request_free(req);
+}
+
+static bool _service_read_passport_cb(LSHandle *handle, LSMessage *message, void *user_data)
+{
+	struct nfc_service *service = user_data;
+	jvalue_ref parsed_obj = NULL;
+	gchar *document_number = NULL, *date_of_birth = NULL, *date_of_expiry = NULL;
+
+	parsed_obj = luna_service_message_parse_and_validate(LSMessageGetPayload(message));
+	if (!parsed_obj) {
+		luna_service_message_reply_error_bad_json(handle, message);
+		return true;
+	}
+
+	/*
+	 * The same three fields printed in the document's own MRZ - proof
+	 * the caller already holds the physical document, which is what BAC
+	 * itself relies on. Dates are YYMMDD; check digits are computed
+	 * here, not expected from the caller.
+	 */
+	document_number = get_string_param(parsed_obj, "documentNumber");
+	date_of_birth = get_string_param(parsed_obj, "dateOfBirth");
+	date_of_expiry = get_string_param(parsed_obj, "dateOfExpiry");
+
+	j_release(&parsed_obj);
+
+	if (!document_number || !date_of_birth || !date_of_expiry) {
+		luna_service_message_reply_custom_error(handle, message,
+			"Expected documentNumber, dateOfBirth and dateOfExpiry (YYMMDD), "
+			"as printed in the document's MRZ");
+		g_free(document_number);
+		g_free(date_of_birth);
+		g_free(date_of_expiry);
+		return true;
+	}
+
+	nfcd_client_read_passport(service->client, document_number, date_of_birth, date_of_expiry,
+	                          read_passport_result_cb, nfc_request_new(handle, message));
+
+	g_free(document_number);
+	g_free(date_of_birth);
+	g_free(date_of_expiry);
+
+	return true;
+}
+
 static LSMethod _nfc_service_methods[] = {
 	{ "getStatus", _service_get_status_cb },
 	{ "setEnabled", _service_set_enabled_cb },
@@ -599,6 +663,7 @@ static LSMethod _nfc_service_methods[] = {
 	{ "writeTag", _service_write_tag_cb },
 	{ "lockTag", _service_lock_tag_cb },
 	{ "cloneTag", _service_clone_tag_cb },
+	{ "readPassport", _service_read_passport_cb },
 	{ "addCardEmulationProfile", _service_add_card_emulation_cb },
 	{ "removeCardEmulationProfile", _service_remove_card_emulation_cb },
 	{ "clearCardEmulation", _service_clear_card_emulation_cb },
