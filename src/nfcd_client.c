@@ -156,6 +156,7 @@ struct passport_read {
 	struct nfcd_client *client;		/* NULL once orphaned */
 	NfcdInterfaceTag *tag;
 	GCancellable *cancellable;
+	gboolean acquired;	/* true once Acquire() succeeded - see passport_acquire_ready() */
 
 	gboolean use_pace;
 
@@ -219,6 +220,8 @@ static void mifare_publish_progress(struct tag_read *read);
 static gboolean mifare_try_cached_key(struct tag_read *read);
 
 static void passport_read_abort(struct passport_read *read);
+static void passport_acquire_ready(GObject *source, GAsyncResult *res, gpointer user_data);
+static void passport_release_ready(GObject *source, GAsyncResult *res, gpointer user_data);
 static void passport_select_aid_ready(GObject *source, GAsyncResult *res, gpointer user_data);
 static void passport_get_challenge_ready(GObject *source, GAsyncResult *res, gpointer user_data);
 static void passport_mutual_auth_ready(GObject *source, GAsyncResult *res, gpointer user_data);
@@ -1144,6 +1147,39 @@ static void passport_read_free(struct passport_read *read)
  * pointers must stay valid across this call but are owned by the caller
  * (passport_build_result_and_finish()), not by read - passport_read_free()
  * above runs before cb() does. */
+static void passport_deactivate_ready(GObject *source, GAsyncResult *res, gpointer user_data)
+{
+	NfcdInterfaceTag *tag = NFCD_INTERFACE_TAG(source);
+	GError *error = NULL;
+
+	if (!nfcd_interface_tag_call_deactivate_finish(tag, res, &error)) {
+		g_warning("Failed to deactivate the tag after a passport read: %s", error->message);
+		g_error_free(error);
+	}
+	g_object_unref(tag);
+}
+
+static void passport_release_ready(GObject *source, GAsyncResult *res, gpointer user_data)
+{
+	NfcdInterfaceTag *tag = NFCD_INTERFACE_TAG(source);
+	GError *error = NULL;
+
+	if (!nfcd_interface_tag_call_release_finish(tag, res, &error)) {
+		/* Best-effort - the read already finished either way. */
+		g_warning("Failed to release the tag after a passport read: %s", error->message);
+		g_error_free(error);
+	}
+
+	/* BAC/PACE is a one-session-per-activation protocol: once a chip has
+	 * completed (or attempted) a handshake, it won't accept a fresh
+	 * MSE:Set AT / MUTUAL AUTHENTICATE on the *same* RF activation, and
+	 * nfcd's continuous presence-check polling never lets the field
+	 * drop on its own. Deactivate forces a real RF_DEACTIVATE, so the
+	 * next read starts from a genuine fresh poll/select instead of a
+	 * stale, already-used session. */
+	nfcd_interface_tag_call_deactivate(tag, NULL, passport_deactivate_ready, NULL);
+}
+
 static void passport_read_finish(struct passport_read *read, gboolean success,
                                  const char *error_text, const PassportResult *result)
 {
@@ -1152,6 +1188,16 @@ static void passport_read_finish(struct passport_read *read, gboolean success,
 
 	if (read->client && read->client->passport_reading == read)
 		read->client->passport_reading = NULL;
+
+	/* Fire-and-forget: give nfcd back exclusive access without making
+	 * the caller wait for it. Not tied to read->cancellable - an
+	 * already-aborted read must still release the tag it acquired. */
+	if (read->acquired && read->tag) {
+		NfcdInterfaceTag *tag = read->tag;
+
+		g_object_ref(tag);
+		nfcd_interface_tag_call_release(tag, NULL, passport_release_ready, NULL);
+	}
 
 	passport_read_free(read);
 
@@ -1256,6 +1302,27 @@ static void passport_tag_proxy_ready(GObject *source, GAsyncResult *res, gpointe
 		passport_read_finish(read, FALSE, "Failed to reach the tag", NULL);
 		return;
 	}
+
+	/* Hold the tag exclusively for the whole multi-round-trip BAC/PACE
+	 * exchange (matching start_type2_write()'s pattern) - without this,
+	 * nfcd's own presence-check polling can interleave with our own
+	 * Transceive calls and leave the RF session stale for the *next*
+	 * read, even though this one still completes fine. */
+	nfcd_interface_tag_call_acquire(read->tag, FALSE, read->cancellable,
+	                                passport_acquire_ready, read);
+}
+
+static void passport_acquire_ready(GObject *source, GAsyncResult *res, gpointer user_data)
+{
+	struct passport_read *read = user_data;
+	GError *error = NULL;
+
+	if (!nfcd_interface_tag_call_acquire_finish(NFCD_INTERFACE_TAG(source), res, &error)) {
+		g_error_free(error);
+		passport_read_finish(read, FALSE, "Failed to acquire the tag", NULL);
+		return;
+	}
+	read->acquired = TRUE;
 
 	/* PACE runs against the MF (no app selected yet) - the eMRTD app
 	 * isn't SELECTed until after secure messaging is up (see
