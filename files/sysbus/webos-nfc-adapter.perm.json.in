@@ -4,5 +4,8 @@
     ],
     "com.webos.surfacemanager-cardshell": [
         "nfc.operation"
+    ],
+    "org.webosports.app.settings.nfc-*": [
+        "nfc.operation"
     ]
 }

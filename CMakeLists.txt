@@ -50,6 +50,17 @@ pkg_check_modules(PBNJSON_C REQUIRED pbnjson_c)
 include_directories(${PBNJSON_C_INCLUDE_DIRS})
 webos_add_compiler_flags(ALL ${PBNJSON_C_CFLAGS_OTHER})
 
+# BAC (passport/eID) key derivation and secure messaging: 3DES, SHA-1
+pkg_check_modules(LIBCRYPTO REQUIRED libcrypto)
+include_directories(${LIBCRYPTO_INCLUDE_DIRS})
+webos_add_compiler_flags(ALL ${LIBCRYPTO_CFLAGS_OTHER})
+
+# DG2 facial photos are JPEG2000 - re-encoded to BMP since Qt has no JP2
+# decoder on this platform (see photo_convert.c)
+pkg_check_modules(LIBOPENJP2 REQUIRED libopenjp2)
+include_directories(${LIBOPENJP2_INCLUDE_DIRS})
+webos_add_compiler_flags(ALL ${LIBOPENJP2_CFLAGS_OTHER})
+
 find_program(GDBUS_CODEGEN_EXECUTABLE NAMES gdbus-codegen DOC "gdbus-codegen executable")
 if(NOT GDBUS_CODEGEN_EXECUTABLE)
 	message(FATAL_ERROR "Executable gdbus-codegen not found")
@@ -76,7 +87,8 @@ webos_add_linker_options(ALL --no-undefined)
 add_executable(webos-nfc-adapter ${SOURCE_FILES})
 target_link_libraries(webos-nfc-adapter
     ${GLIB2_LDFLAGS} ${LUNASERVICE2_LDFLAGS} ${PBNJSON_C_LDFLAGS}
-    ${GIO2_LDFLAGS} ${GIO-UNIX_LDFLAGS} ${GOBJECT2_LDFLAGS}
+    ${GIO2_LDFLAGS} ${GIO-UNIX_LDFLAGS} ${GOBJECT2_LDFLAGS} ${LIBCRYPTO_LDFLAGS}
+    ${LIBOPENJP2_LDFLAGS}
     rt pthread)
 
 webos_build_daemon()

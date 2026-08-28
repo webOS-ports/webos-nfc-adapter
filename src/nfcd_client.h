@@ -22,6 +22,8 @@
 #include <glib.h>
 #include <pbnjson.h>
 
+#include "bac.h"
+
 /**
  * Client for the nfcd D-Bus API. Two bus names on the system bus are involved:
  *
@@ -49,6 +51,23 @@ typedef void (*nfcd_hce_cb)(struct nfcd_client *client, void *user_data);
 
 /* Completion of a request that can fail */
 typedef void (*nfcd_result_cb)(gboolean success, const char *error_text, void *user_data);
+
+/* Result of a successful passport/eID read - fields are always populated
+ * (MRZ parsing failing after a successful DG1 read would itself be
+ * reported as a failure, never a NULL PassportResult with success=TRUE).
+ * photo/photo_len/photo_format are NULL/0/NULL unless read_photo was
+ * requested and DG2 both read and contained a recognizable image. */
+typedef struct {
+	const char *mrz_text;
+	const MrzFields *fields;
+	const guint8 *photo;
+	gsize photo_len;
+	const char *photo_format;	/* "jpeg" or "jpeg2000" */
+} PassportResult;
+
+/* Completion of a passport/eID BAC read - result is NULL on failure */
+typedef void (*nfcd_passport_cb)(gboolean success, const char *error_text,
+                                 const PassportResult *result, void *user_data);
 
 struct nfcd_client *nfcd_client_create(nfcd_state_cb state_cb, nfcd_tag_cb tag_cb,
                                        nfcd_hce_cb hce_cb, void *user_data);
@@ -128,6 +147,35 @@ void nfcd_client_remove_card_emulation_profile(struct nfcd_client *client,
 /* Unregisters every profile added via nfcd_client_add_card_emulation_profile() */
 void nfcd_client_clear_card_emulation(struct nfcd_client *client,
                                       nfcd_result_cb cb, void *user_data);
+
+/**
+ * Reads the tag currently in the field as an ICAO 9303 eMRTD chip (passport
+ * or eID) using Basic Access Control: derives the chip access keys from
+ * document_number/date_of_birth/date_of_expiry (the same three fields
+ * printed in the document's own MRZ - dates as YYMMDD, check digits
+ * computed here), runs the BAC handshake, and reads EF.DG1 (the chip's own
+ * copy of the MRZ) under secure messaging as proof the handshake worked.
+ * Only usable by whoever can already read the document's printed MRZ -
+ * that is what BAC itself requires. Fails cleanly (not a crash or hang) if
+ * the tag isn't ISO-DEP, the MRZ data is wrong, or the document needs PACE
+ * instead of BAC (common on newer EU documents).
+ *
+ * If read_photo is TRUE, also reads EF.DG2 (the facial photo) after DG1
+ * and includes it in the result - this costs several extra APDU round
+ * trips, so it's opt-in rather than always-on.
+ */
+void nfcd_client_read_passport(struct nfcd_client *client, const char *document_number,
+                               const char *date_of_birth, const char *date_of_expiry,
+                               gboolean read_photo, nfcd_passport_cb cb, void *user_data);
+
+/**
+ * Same read, but via PACE (using the document's printed CAN) instead of
+ * BAC - the path documents that reject nfcd_client_read_passport() with
+ * "instead of BAC" need. Same failure-mode guarantees and read_photo
+ * meaning as above.
+ */
+void nfcd_client_read_passport_pace(struct nfcd_client *client, const char *can,
+                                    gboolean read_photo, nfcd_passport_cb cb, void *user_data);
 
 /**
  * The most recent reader-confirmed card-emulation exchange: which AID was

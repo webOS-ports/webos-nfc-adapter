@@ -6,6 +6,8 @@
         "com.webos.service.nfc/writeTag",
         "com.webos.service.nfc/lockTag",
         "com.webos.service.nfc/cloneTag",
+        "com.webos.service.nfc/readPassport",
+        "com.webos.service.nfc/readPassportPACE",
         "com.webos.service.nfc/addCardEmulationProfile",
         "com.webos.service.nfc/removeCardEmulationProfile",
         "com.webos.service.nfc/clearCardEmulation"
