@@ -71,8 +71,9 @@ set(GDBUS_IF_DIR ${WEBOS_BINARY_CONFIGURED_DIR}/src)
 file (MAKE_DIRECTORY ${GDBUS_IF_DIR})
 
 execute_process(COMMAND ${GDBUS_CODEGEN_EXECUTABLE} --c-namespace NfcdInterface --generate-c-code
-						${GDBUS_IF_DIR}/nfcd-interface --interface-prefix org.sailfishos.nfc.
+						nfcd-interface --interface-prefix org.sailfishos.nfc.
 						${CMAKE_CURRENT_SOURCE_DIR}/files/xml/nfcd.xml
+						WORKING_DIRECTORY ${GDBUS_IF_DIR}
 						RESULT_VARIABLE codegen_failed)
 if(codegen_failed)
 		message(FATAL_ERROR "Error in generating code for nfcd interface using gdbus-codegen")
