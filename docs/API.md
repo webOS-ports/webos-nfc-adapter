@@ -74,7 +74,7 @@ emulation needs `nfc.operation`.
 
 Default grants (`files/sysbus/webos-nfc-adapter.perm.json.in`) give
 `nfc.operation` to `com.webos.service.nfc` itself,
-`com.webos.surfacemanager-cardshell`, and
+`com.webos.surfacemanager.cardshell`, and
 `org.webosports.app.settings.nfc-*`. Other clients must request the group
 through their own role/permission files, e.g. in an app's `appinfo.json`:
 
