@@ -119,6 +119,11 @@ appearing/disappearing, NFC toggled, a target entering or leaving the field).
 Mode bits: `0x01` P2P initiator, `0x02` reader/writer, `0x04` P2P target,
 `0x08` card emulation. Tech bits: `0x01` NFC-A, `0x02` NFC-B, `0x04` NFC-F.
 
+Reader/writer is on only while the display is on, as on Android: with the
+display off the service has nfcd stop polling, so `mode` drops the `0x02`
+bit (usually to `0`) and no tag is detected until the display comes back on.
+Card emulation is unaffected.
+
 ### Example
 
 ```

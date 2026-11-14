@@ -1,6 +1,7 @@
 {
     "com.webos.service.nfc": [
-        "nfc.operation"
+        "nfc.operation",
+        "display.query"
     ],
     "com.webos.surfacemanager.cardshell": [
         "nfc.operation"

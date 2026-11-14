@@ -96,6 +96,14 @@ void nfcd_client_set_enabled(struct nfcd_client *client, gboolean enabled,
                              nfcd_result_cb cb, void *user_data);
 
 /**
+ * Whether nfcd should poll for tags (reader/writer mode). TRUE when created.
+ * The service clears it while the display is off, as Android does: polling,
+ * a tag left in the field kept the controller's wakeup source active and the
+ * phone awake for as long as it lay there. Card emulation is unaffected.
+ */
+void nfcd_client_set_reader_wanted(struct nfcd_client *client, gboolean wanted);
+
+/**
  * Writes an NDEF message to the Type 2 tag currently in the field. Takes
  * ownership of nothing: the caller still owns message.
  */

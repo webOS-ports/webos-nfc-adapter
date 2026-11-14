@@ -78,6 +78,17 @@ struct nfcd_client {
 	 */
 	guint mode_request_id;
 
+	/* While the display is off we hold a second request that disables
+	 * reader/writer, see nfcd_client_set_reader_wanted(). reader_wanted is
+	 * TRUE unless the service said otherwise; reader_block_id is that
+	 * request's id, 0 when not held; reader_block_daemon is the daemon
+	 * proxy a RequestMode call for it is in flight on, NULL when none is,
+	 * so it is never requested twice and a reply from a daemon that has
+	 * since gone is told apart. */
+	gboolean reader_wanted;
+	guint reader_block_id;
+	NfcdInterfaceDaemon *reader_block_daemon;
+
 	/* The enabled flag is owned by the settings plugin, but the adapter
 	 * reports it too. Prefer the settings value when we have it. */
 	gboolean settings_valid;
@@ -2532,6 +2543,94 @@ static void request_reader_writer_mode_ready(GObject *source, GAsyncResult *res,
 	}
 }
 
+static void update_reader_block(struct nfcd_client *client);
+
+static void request_reader_block_ready(GObject *source, GAsyncResult *res,
+                                       gpointer user_data)
+{
+	struct nfcd_client *client = user_data;
+	NfcdInterfaceDaemon *daemon = NFCD_INTERFACE_DAEMON(source);
+	GError *error = NULL;
+	guint id = 0;
+	gboolean ok;
+
+	ok = nfcd_interface_daemon_call_request_mode_finish(daemon, &id, res, &error);
+
+	/* Cancelled means the client is being freed: touch nothing */
+	if (!ok && g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED)) {
+		g_error_free(error);
+		return;
+	}
+
+	if (client->reader_block_daemon == daemon)
+		client->reader_block_daemon = NULL;
+
+	if (!ok) {
+		/* The radio keeps polling with the display off until the next
+		 * display-off or nfcd restart tries again: costs battery, not NFC */
+		g_warning("Failed to stop reader/writer mode: %s", error->message);
+		g_error_free(error);
+		return;
+	}
+
+	if (daemon != client->daemon) {
+		/* Granted by a daemon that has since gone away or been replaced;
+		 * the id means nothing to the current one. */
+		return;
+	}
+
+	client->reader_block_id = id;
+
+	/* The display may have come back on while the request was in flight */
+	update_reader_block(client);
+}
+
+/*
+ * Holds or releases the request that disables reader/writer, to match
+ * reader_wanted. nfcd applies mode requests in the order they were made,
+ * each as (mode & ~disable) | enable, on top of its default mode - which is
+ * reader/writer already - so releasing our own reader/writer request would
+ * change nothing; it takes a request that disables it. With no mode left,
+ * nfcd stops RF discovery: nothing polls, and a tag left in the field (a
+ * card under the phone, a wallet case) can no longer keep the controller's
+ * interrupt, and with it the whole phone, awake.
+ */
+static void update_reader_block(struct nfcd_client *client)
+{
+	if (!client->daemon)
+		return;
+
+	if (!client->reader_wanted) {
+		if (client->reader_block_id || client->reader_block_daemon == client->daemon)
+			return;
+
+		client->reader_block_daemon = client->daemon;
+		nfcd_interface_daemon_call_request_mode(client->daemon, 0,
+		                                        NFCD_MODE_READER_WRITER,
+		                                        client->cancellable,
+		                                        request_reader_block_ready,
+		                                        client);
+	} else if (client->reader_block_id) {
+		nfcd_interface_daemon_call_release_mode(client->daemon,
+		                                        client->reader_block_id,
+		                                        client->cancellable, NULL, NULL);
+		client->reader_block_id = 0;
+	}
+}
+
+void nfcd_client_set_reader_wanted(struct nfcd_client *client, gboolean wanted)
+{
+	wanted = wanted ? TRUE : FALSE;
+
+	if (!client || client->reader_wanted == wanted)
+		return;
+
+	g_message("%s reader/writer mode", wanted ? "Resuming" : "Stopping");
+
+	client->reader_wanted = wanted;
+	update_reader_block(client);
+}
+
 static void daemon_proxy_ready(GObject *source, GAsyncResult *res, gpointer user_data)
 {
 	struct nfcd_client *client = user_data;
@@ -2552,6 +2651,8 @@ static void daemon_proxy_ready(GObject *source, GAsyncResult *res, gpointer user
 
 	client->daemon = daemon;
 	client->mode_request_id = 0;
+	client->reader_block_id = 0;
+	client->reader_block_daemon = NULL;
 
 	g_signal_connect(daemon, "adapters-changed",
 	                 G_CALLBACK(daemon_adapters_changed), client);
@@ -2560,17 +2661,19 @@ static void daemon_proxy_ready(GObject *source, GAsyncResult *res, gpointer user
 	                                    daemon_get_all_ready, client);
 
 	/*
-	 * nfcd starts every adapter with mode 0 (nothing polling) and expects a
-	 * client to ask for a mode: on Sailfish that's their screen-state aware
-	 * NFC middleware, which LuneOS has no equivalent of. Tools like ndef-read
-	 * only listen for tags-changed, they never request a mode themselves, so
-	 * without this nothing would ever be detected. Hold reader/writer for as
-	 * long as we're connected to the daemon; nfcd's own enabled setting
-	 * remains the real on/off switch.
+	 * Hold reader/writer for as long as we're connected to the daemon, so
+	 * tools like ndef-read, which only listen for tags-changed and never
+	 * request a mode themselves, find the radio polling. nfcd's own enabled
+	 * setting remains the real on/off switch. (nfcd 1.2.7's default mode is
+	 * reader/writer already, so this holds it rather than turns it on; on
+	 * Sailfish the screen-state aware middleware decides, and here
+	 * nfcd_client_set_reader_wanted() does that job.)
 	 */
 	nfcd_interface_daemon_call_request_mode(daemon, NFCD_MODE_READER_WRITER, 0,
 	                                        client->cancellable,
 	                                        request_reader_writer_mode_ready, client);
+
+	update_reader_block(client);
 }
 
 static void daemon_appeared(GDBusConnection *connection, const gchar *name,
@@ -2600,6 +2703,8 @@ static void daemon_vanished(GDBusConnection *connection, const gchar *name,
 
 	client->daemon_version = 0;
 	client->mode_request_id = 0;
+	client->reader_block_id = 0;
+	client->reader_block_daemon = NULL;
 
 	attach_adapter(client, NULL);
 }
@@ -2708,6 +2813,7 @@ struct nfcd_client *nfcd_client_create(nfcd_state_cb state_cb, nfcd_tag_cb tag_c
 	client->hce_cb = hce_cb;
 	client->user_data = user_data;
 	client->cancellable = g_cancellable_new();
+	client->reader_wanted = TRUE;
 	client->mifare_key_cache = g_hash_table_new_full(g_str_hash, g_str_equal,
 	                                                 g_free, g_free);
 

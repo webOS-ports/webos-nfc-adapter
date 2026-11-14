@@ -28,12 +28,18 @@
 #include "bac.h"
 
 #define NFC_SERVICE_NAME	"com.webos.service.nfc"
+#define DISPLAY_SERVICE_NAME	"com.palm.display"
+#define DISPLAY_STATUS_URI	"luna://com.palm.display/control/status"
 
 extern GMainLoop *event_loop;
 
 struct nfc_service {
 	LSHandle *handle;
 	struct nfcd_client *client;
+
+	/* com.palm.display/control/status subscription, see display_status_cb() */
+	void *display_server_cookie;
+	LSMessageToken display_status_token;
 };
 
 /* Keeps a message alive across an asynchronous nfcd call */
@@ -168,6 +174,112 @@ static void hce_changed_cb(struct nfcd_client *client, void *user_data)
 
 	luna_service_post_subscription(service->handle, "/", "getCardEmulationEvent", reply_obj);
 	j_release(&reply_obj);
+}
+
+/*
+ * Display state
+ *
+ * NFC polls for tags only while the display is on, as Android does.
+ * Polling with the display off, a tag left in the field - the phone lying on a
+ * bank card, a card in a wallet case - kept the controller's interrupt firing
+ * and its wakeup source active, and the phone could not suspend for as long
+ * as it lay there. Measured on the Unihertz Titan (14 Nov 2026), unplugged on
+ * an NFC card with the display off: sleepd's every attempt refused with
+ * "wakeup source still active: 3-0008" (the ST21NFC), one suspend in an hour,
+ * 381 mA average, against 99.5% asleep at 14 mA the night before, off the
+ * card (with Wi-Fi off).
+ *
+ * Whenever the display state is unknown - before the display manager is up,
+ * after it goes away, on an error reply - it keeps polling, so a failure
+ * here costs battery, never NFC.
+ */
+
+static gchar *get_string_param(jvalue_ref parsed_obj, const char *name);
+
+static bool display_status_cb(LSHandle *handle, LSMessage *message, void *user_data)
+{
+	struct nfc_service *service = user_data;
+	jvalue_ref parsed_obj;
+	gchar *event, *state;
+	bool return_value = true;
+	jvalue_ref value_obj = NULL;
+
+	parsed_obj = luna_service_message_parse_and_validate(LSMessageGetPayload(message));
+	if (!parsed_obj)
+		return true;
+
+	if (jobject_get_exists(parsed_obj, J_CSTR_TO_BUF("returnValue"), &value_obj) &&
+	    jis_boolean(value_obj))
+		jboolean_get(value_obj, &return_value);
+
+	if (!return_value) {
+		g_warning("Display status subscription failed: %s", LSMessageGetPayload(message));
+		nfcd_client_set_reader_wanted(service->client, TRUE);
+		j_release(&parsed_obj);
+		return true;
+	}
+
+	/*
+	 * The first reply is {"event": "request", "state": "on"|"dimmed"|"off"},
+	 * later ones carry only the event: displayOn, displayDimmed, displayOff,
+	 * plus displayActive/displayInactive and the proximity block events,
+	 * which say nothing about whether the panel is lit and are ignored.
+	 */
+	event = get_string_param(parsed_obj, "event");
+	state = get_string_param(parsed_obj, "state");
+
+	if (g_strcmp0(event, "displayOff") == 0)
+		nfcd_client_set_reader_wanted(service->client, FALSE);
+	else if (g_strcmp0(event, "displayOn") == 0 || g_strcmp0(event, "displayDimmed") == 0)
+		nfcd_client_set_reader_wanted(service->client, TRUE);
+	else if (g_strcmp0(event, "request") == 0 && state)
+		nfcd_client_set_reader_wanted(service->client, g_strcmp0(state, "off") != 0);
+
+	g_free(event);
+	g_free(state);
+	j_release(&parsed_obj);
+
+	return true;
+}
+
+static void display_status_cancel(struct nfc_service *service)
+{
+	LSError error;
+
+	if (!service->display_status_token)
+		return;
+
+	LSErrorInit(&error);
+
+	if (!LSCallCancel(service->handle, service->display_status_token, &error))
+		LSErrorFree(&error);
+
+	service->display_status_token = LSMESSAGE_TOKEN_INVALID;
+}
+
+static bool display_server_status_cb(LSHandle *handle, const char *service_name,
+                                     bool connected, void *user_data)
+{
+	struct nfc_service *service = user_data;
+	LSError error;
+
+	display_status_cancel(service);
+
+	if (!connected) {
+		nfcd_client_set_reader_wanted(service->client, TRUE);
+		return true;
+	}
+
+	LSErrorInit(&error);
+
+	if (!LSCall(handle, DISPLAY_STATUS_URI, "{\"subscribe\":true}", display_status_cb,
+	            service, &service->display_status_token, &error)) {
+		g_warning("Failed to subscribe to %s: %s", DISPLAY_STATUS_URI, error.message);
+		LSErrorFree(&error);
+		service->display_status_token = LSMESSAGE_TOKEN_INVALID;
+	}
+
+	return true;
 }
 
 /*
@@ -799,6 +911,15 @@ struct nfc_service *nfc_service_create(void)
 
 	service->client = nfcd_client_create(state_changed_cb, tag_changed_cb, hce_changed_cb, service);
 
+	if (!LSRegisterServerStatusEx(service->handle, DISPLAY_SERVICE_NAME,
+	                              display_server_status_cb, service,
+	                              &service->display_server_cookie, &error)) {
+		g_warning("Failed to watch %s, NFC will poll with the display off: %s",
+		          DISPLAY_SERVICE_NAME, error.message);
+		LSErrorFree(&error);
+		service->display_server_cookie = NULL;
+	}
+
 	return service;
 
 failed:
@@ -824,6 +945,14 @@ void nfc_service_free(struct nfc_service *service)
 		return;
 
 	LSErrorInit(&error);
+
+	if (service->display_server_cookie &&
+	    !LSCancelServerStatus(service->handle, service->display_server_cookie, &error)) {
+		LSErrorFree(&error);
+		LSErrorInit(&error);
+	}
+
+	display_status_cancel(service);
 
 	if (service->client)
 		nfcd_client_free(service->client);
